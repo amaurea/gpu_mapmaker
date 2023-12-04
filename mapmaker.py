@@ -13,8 +13,9 @@ if __name__ == "__main__":
 
 import numpy as np, os, time
 from pixell import enmap, utils, mpi, bunch, fft, colors, memory
-import so3g
+import so3g, cupy
 from sotodlib import coords
+import pointing, gpu_mm
 
 def read_tod(fname):
 	"""Read a tod file in the simple npz format we use"""
@@ -32,6 +33,8 @@ def read_tod(fname):
 		res.tod          = f["tod"]                  # [ndet,nsamp]
 		res.cuts         = mask2cuts(f["cuts"])
 	return res
+
+def round_by(n, b): return (np.array(n)+b-1)//b*b
 
 def mask2cuts(mask):
 	return so3g.proj.ranges.RangesMatrix.from_mask(mask)
@@ -320,14 +323,128 @@ class NmatDetvecs(Nmat):
 				window=data.window, nwin=data.nwin, downweight=data.downweight,
 				bins=data.bins, D=data.D, V=data.V, iD=data.iD, iV=data.iV, s=data.s, ivar=data.ivar)
 
+class NmatDetvecsGpu(Nmat):
+	def __init__(self, bin_edges=None, eig_lim=16, single_lim=0.55, mode_bins=[0.25,4.0,20],
+			downweight=[], window=2, nwin=None, verbose=False, bins=None, D=None, V=None, E=None, ivar=None):
+		# Variables used for building the noise model
+		if bin_edges is None: bin_edges = np.array([
+			0.16, 0.25, 0.35, 0.45, 0.55, 0.70, 0.85, 1.00,
+			1.20, 1.40, 1.70, 2.00, 2.40, 2.80, 3.40, 3.80,
+			4.60, 5.00, 5.50, 6.00, 6.50, 7.00, 8.00, 9.00, 10.0, 11.0,
+			12.0, 13.0, 14.0, 16.0, 18.0, 20.0, 22.0,
+			24.0, 26.0, 28.0, 30.0, 32.0, 36.5, 41.0,
+			45.0, 50.0, 55.0, 65.0, 70.0, 80.0, 90.0,
+			100., 110., 120., 130., 140., 150., 160., 170.,
+			180., 190.
+		])
+		self.bin_edges = np.array(bin_edges)
+		self.mode_bins = np.array(mode_bins)
+		self.eig_lim   = np.zeros(len(mode_bins))+eig_lim
+		self.single_lim= np.zeros(len(mode_bins))+single_lim
+		self.verbose   = verbose
+		self.downweight= downweight
+		# Variables used for applying the noise model
+		self.bins      = bins
+		self.window    = window
+		self.nwin      = nwin
+		self.D, self.V, self.E, self.ivar = D, V, E, ivar
+		self.ready      = all([a is not None for a in [D, V, E, ivar]])
+		if self.ready:
+			self.D, self.V, self.E, self.ivar = [cupy.asarray(a) for a in [D, V, E, ivar]]
+	def build(self, tod, srate, extra=False, **kwargs):
+		# Apply window before measuring noise model
+		nwin  = utils.nint(self.window*srate)
+		tod   = cupy.asarray(tod)
+		apply_window(tod, nwin)
+		ft    = cupy.fft.rfft(tod)
+		# Unapply window again
+		apply_window(tod, nwin, -1)
+		ndet, nfreq = ft.shape
+		nsamp = tod.shape[1]
+		# First build our set of eigenvectors in two bins. The first goes from
+		# 0.25 to 4 Hz the second from 4Hz and up
+		mode_bins = makebins(self.mode_bins, srate, nfreq, 1000, rfun=np.round)[1:]
+		if np.any(np.diff(mode_bins) < 0):
+			raise RuntimeError(f"At least one of the frequency bins has a negative range: \n{mode_bins}")
+		# Then use these to get our set of basis vectors
+		V = find_modes_jon(ft, mode_bins, eig_lim=self.eig_lim, single_lim=self.single_lim, verbose=self.verbose)
+		nmode= V.shape[1]
+		if V.size == 0: raise errors.ModelError("Could not find any noise modes")
+		# Cut bins that extend beyond our max frequency
+		bin_edges = self.bin_edges[self.bin_edges < srate/2 * 0.99]
+		bins      = makebins(bin_edges, srate, nfreq, nmin=2*nmode, rfun=np.round)
+		nbin      = len(bins)
+		# Now measure the power of each basis vector in each bin. The residual
+		# noise will be modeled as uncorrelated
+		E  = cupy.zeros([nbin,nmode])
+		D  = cupy.zeros([nbin,ndet])
+		Nd = cupy.zeros([nbin,ndet])
+		for bi, b in enumerate(bins):
+			# Skip the DC mode, since it's it's unmeasurable and filtered away
+			b = np.maximum(1,b)
+			E[bi], D[bi], Nd[bi] = measure_detvecs(ft[:,b[0]:b[1]], V)
+		# Optionally downweight the lowest frequency bins
+		if self.downweight != None and len(self.downweight) > 0:
+			D[:len(self.downweight)] /= cupy.array(self.downweight)[:,None]
+		# Also compute a representative white noise level
+		bsize = bins[:,1]-bins[:,0]
+		ivar  = np.sum(1/D.get()*bsize[:,None],0)/np.sum(bsize)
+		ivar *= tod.shape[1]
+		nmat  = NmatDetvecsGpu(bin_edges=self.bin_edges, eig_lim=self.eig_lim, single_lim=self.single_lim,
+				window=self.window, nwin=nwin, downweight=self.downweight, verbose=self.verbose,
+				bins=bins, D=D, V=V, E=E, ivar=ivar)
+		return nmat
+	def apply(self, tod, inplace=True):
+		ap  = anypy(self.D)
+		gtod= ap.array(tod)
+		apply_window(gtod, self.nwin)
+		ft = ap.fft.rfft(gtod, axis=1)
+		# If we don't cast to real here, we get the same result but much slower
+		rft = ft.view(gtod.dtype)
+		for i, (b1,b2) in enumerate(self.bins*2):
+			# N  = D + VEV'
+			# N" = D" - D"V(E"+V'DV)"V'D"
+			# We want N"ft
+			iA   = 1/self.D[i,:]
+			core = ap.linalg.inv(ap.diag(1/self.E[i]) + self.V.T @ (iA[:,None]*self.V))
+			iAd  = iA[:,None]*rft[:,b1:b2]
+			rft[:,b1:b2] = iAd - iA[:,None] * (self.V @ core @ self.V.T @ iAd)
+		gtod[:]=ap.fft.irfft(ft,axis=1,n=tod.shape[1],norm="forward")
+		apply_window(gtod, self.nwin)
+		if inplace: tod[:] = gtod.get()
+		else: tod = gtod.get()
+		return tod
+	def white(self, tod, inplace=True):
+		ap   = anypy(self.D)
+		gtod = ap.array(tod)
+		apply_window(gtod, self.nwin)
+		gtod *= self.ivar[:,None]
+		apply_window(gtod, self.nwin)
+		if inplace: tod[:] = gtod.get()
+		else: tod = gtod.get()
+		print("ivar gtod", np.std(tod))
+		return tod
+	def write(self, fname):
+		data = bunch.Bunch(type="NmatDetvecsGpu")
+		for field in ["bin_edges", "eig_lim", "single_lim", "window", "nwin", "downweight",
+				"bins", "D", "V", "E", "ivar"]:
+			data[field] = getattr(self, field)
+		bunch.write(fname, data)
+	@staticmethod
+	def from_bunch(data):
+		return NmatDetvecsGpu(bin_edges=data.bin_edges, eig_lim=data.eig_lim, single_lim=data.single_lim,
+				window=data.window, nwin=data.nwin, downweight=data.downweight,
+				bins=data.bins, D=data.D, V=data.V, E=data.E, ivar=data.ivar)
+
 def measure_cov(d, nmax=10000):
+	ap    = anypy(d)
 	d = d[:,::max(1,d.shape[1]//nmax)]
-	n,m = d.shape
+	n,m   = d.shape
 	step  = 10000
-	res = np.zeros((n,n),d.dtype)
+	res = ap.zeros((n,n),utils.real_dtype(d.dtype))
 	for i in range(0,m,step):
-		sub = mycontiguous(d[:,i:i+step])
-		res += np.real(sub.dot(np.conj(sub.T)))
+		sub = ap.ascontiguousarray(d[:,i:i+step])
+		res += sub.dot(ap.conj(sub.T)).real
 	return res/m
 
 def project_out(d, modes): return d-modes.T.dot(modes.dot(d))
@@ -370,50 +487,52 @@ def mycontiguous(a):
 	return b
 
 def find_modes_jon(ft, bins, eig_lim=None, single_lim=0, skip_mean=False, verbose=False):
+	ap   = anypy(ft)
 	ndet = ft.shape[0]
-	vecs = np.zeros([ndet,0])
+	vecs = ap.zeros([ndet,0])
 	if not skip_mean:
 		# Force the uniform common mode to be included. This
 		# assumes all the detectors have accurately measured gain.
 		# Forcing this avoids the possibility that we don't find
 		# any modes at all.
-		vecs = np.concatenate([vecs,np.full([ndet,1],ndet**-0.5)],1)
+		vecs = ap.concatenate([vecs,ap.full([ndet,1],ndet**-0.5)],1)
 	for bi, b in enumerate(bins):
 		d    = ft[:,b[0]:b[1]]
 		cov  = measure_cov(d)
 		cov  = project_out_from_matrix(cov, vecs)
-		e, v = np.linalg.eig(cov)
-		e, v = e.real, v.real
+		e, v = ap.linalg.eigh(cov)
+		#e, v = e.real, v.real
 		#e, v = e[::-1], v[:,::-1]
-		accept = np.full(len(e), True, bool)
+		accept = ap.full(len(e), True, bool)
 		if eig_lim is not None:
 			# Compute median, exempting modes we don't have enough data to measure
 			nsamp    = b[1]-b[0]+1
-			median_e = np.median(np.sort(e)[::-1][:nsamp])
+			median_e = ap.median(ap.sort(e)[::-1][:nsamp])
 			accept  &= e/median_e >= eig_lim[bi]
-		if verbose: print("bin %d: %4d modes above eig_lim" % (bi, np.sum(accept)))
+		if verbose: print("bin %d: %4d modes above eig_lim" % (bi, ap.sum(accept)))
 		if single_lim is not None and e.size:
 			# Reject modes too concentrated into a single mode. Since v is normalized,
 			# values close to 1 in a single component must mean that all other components are small
-			singleness = np.max(np.abs(v),0)
+			singleness = ap.max(ap.abs(v),0)
 			accept    &= singleness < single_lim[bi]
-		if verbose: print("bin %d: %4d modes also above single_lim" % (bi, np.sum(accept)))
+		if verbose: print("bin %d: %4d modes also above single_lim" % (bi, ap.sum(accept)))
 		e, v = e[accept], v[:,accept]
-		vecs = np.concatenate([vecs,v],1)
+		vecs = ap.concatenate([vecs,v],1)
 	return vecs
 
 def measure_detvecs(ft, vecs):
 	# Measure amps when we have non-orthogonal vecs
+	ap   = anypy(ft)
 	rhs  = vecs.T.dot(ft)
 	div  = vecs.T.dot(vecs)
-	amps = np.linalg.solve(div,rhs)
-	E    = np.mean(np.abs(amps)**2,1)
+	amps = ap.linalg.solve(div,rhs)
+	E    = ap.mean(ap.abs(amps)**2,1)
 	# Project out modes for every frequency individually
 	dclean = ft - vecs.dot(amps)
 	# The rest is assumed to be uncorrelated
-	Nu = np.mean(np.abs(dclean)**2,1)
+	Nu = ap.mean(ap.abs(dclean)**2,1)
 	# The total auto-power
-	Nd = np.mean(np.abs(ft)**2,1)
+	Nd = ap.mean(ap.abs(ft)**2,1)
 	return E, Nu, Nd
 
 def sichol(A):
@@ -427,6 +546,14 @@ def safe_inv(a):
 		res = 1/a
 		res[~np.isfinite(res)] = 0
 	return res
+
+def safe_invert_ivar(ivar, tol=1e-3):
+	vals = ivar[ivar!=0]
+	ref  = np.mean(vals[::100])
+	iivar= ivar*0
+	good = ivar>ref*tol
+	iivar[good] = 1/ivar[good]
+	return iivar
 
 def woodbury_invert(D, V, s=1):
 	"""Given a compressed representation C = D + sVV', compute a
@@ -448,10 +575,17 @@ def woodbury_invert(D, V, s=1):
 	sout = -sout
 	return iD, iV, sout
 
+def anypy(arr):
+	"""Return numpy or cupy depending on what type of array we have.
+	Useful for writing code that works both on cpu and gpu"""
+	if   isinstance(arr, cupy.ndarray): return cupy
+	else: return np
+
 def apply_window(tod, nsamp, exp=1):
 	"""Apply a cosine taper to each end of the TOD."""
 	if nsamp <= 0: return
-	taper   = 0.5*(1-np.cos(np.arange(1,nsamp+1)*np.pi/nsamp))
+	ap = anypy(tod)
+	taper   = 0.5*(1-ap.cos(ap.arange(1,nsamp+1)*ap.pi/nsamp))
 	taper **= exp
 	tod[...,:nsamp]  *= taper
 	tod[...,-nsamp:] *= taper[::-1]
@@ -602,6 +736,115 @@ class SignalMap(Signal):
 			enmap.write_map(oname, m)
 		return oname
 
+class SignalMapGpu(Signal):
+	"""Signal describing a non-distributed sky map."""
+	def __init__(self, shape, wcs, comm, name="sky", ofmt="{name}", output=True,
+			ext="fits", dtype=np.float32, sys=None, interpol=None):
+		"""Signal describing a sky map in the coordinate system given by "sys", which defaults
+		to equatorial coordinates. If tiled==True, then this will be a distributed map with
+		the given tile_shape, otherwise it will be a plain enmap. interpol controls the
+		pointing matrix interpolation mode. See so3g's Projectionist docstring for details."""
+		Signal.__init__(self, name, ofmt, output, ext)
+		self.comm  = comm
+		self.sys   = sys
+		self.dtype = dtype
+		self.interpol = interpol
+		self.data  = {}
+		self.comps = "TQU"
+		self.ncomp = 3
+		self.ishape= tuple(shape[-2:])
+		shape      = tuple(round_by(shape[-2:], 64))
+		self.rhs = enmap.zeros((self.ncomp,)+shape, wcs, dtype=dtype)
+		self.div = enmap.zeros(              shape, wcs, dtype=dtype)
+		self.hits= enmap.zeros(              shape, wcs, dtype=dtype)
+	def add_obs(self, id, obs, nmat, Nd, pmap=None):
+		"""Add and process an observation, building the pointing matrix
+		and our part of the RHS. "obs" should be an Observation axis manager,
+		nmat a noise model, representing the inverse noise covariance matrix,
+		and Nd the result of applying the noise model to the detector time-ordered data.
+		"""
+		Nd	 = Nd.copy() # This copy can be avoided if build_obs is split into two parts
+		ctime  = obs.ctime
+		t1     = time.time()
+		pcut   = PmatCut(obs.cuts) # could pass this in, but fast to construct
+		if pmap is None:
+			pmap = PmatMapGpu(self.rhs.shape, self.rhs.wcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, dtype=obs.tod.dtype)
+		# Build the RHS for this observation
+		t2 = time.time()
+		pcut.clear(Nd)
+		obs_rhs = pmap.backward(Nd)
+		t3 = time.time()
+		# Build the per-pixel inverse variance for this observation.
+		# This will be scalar to make the preconditioner fast, but uses
+		# ncomp while building since pmat expects that
+		ones         = np.zeros_like(obs_rhs)
+		ones[0]      = 1
+		Nd[:]        = 0
+		pmap.forward(Nd, ones)
+		pcut.clear(Nd)
+		Nd = nmat.white(Nd)
+		obs_div = pmap.backward(Nd)[0]
+		t4 = time.time()
+		# Build hitcount
+		Nd[:]        = 0
+		pmap.forward(Nd, ones)
+		pcut.clear(Nd)
+		obs_hits = pmap.backward(Nd)[0]
+		t5 = time.time()
+		del Nd, ones
+		# Update our full rhs and div. This works for both plain and distributed maps
+		self.rhs = self.rhs .insert(obs_rhs, op=np.ndarray.__iadd__)
+		self.div = self.div .insert(obs_div, op=np.ndarray.__iadd__)
+		self.hits= self.hits.insert(obs_hits,op=np.ndarray.__iadd__)
+		t6 = time.time()
+		L.print("Init map pmat %6.3f rhs %6.3f div %6.3f hit %6.3f add %6.3f %s" % (t2-t1,t3-t2,t4-t3,t5-t4,t6-t5,id), level=2)
+		# Save the per-obs things we need. Just the pointing matrix in our case.
+		# Nmat and other non-Signal-specific things are handled in the mapmaker itself.
+		self.data[id] = bunch.Bunch(pmap=pmap, obs_geo=obs_rhs.geometry)
+	def prepare(self):
+		"""Called when we're done adding everything. Sets up the map distribution,
+		degrees of freedom and preconditioner."""
+		if self.ready: return
+		t1 = time.time()
+		if self.comm is not None:
+			self.rhs  = utils.allreduce(self.rhs, self.comm)
+			self.div  = utils.allreduce(self.div, self.comm)
+			self.hits = utils.allreduce(self.hits,self.comm)
+		self.dof   = MapZipper(*self.rhs.geometry, dtype=self.dtype)
+		#self.idiv  = safe_invert_ivar(self.div)
+		self.idiv  = safe_inv(self.div)
+		t2 = time.time()
+		L.print("Prep map %6.3f" % (t2-t1), level=2)
+		self.ready = True
+	def forward(self, id, tod, map, tmul=1, mmul=1):
+		"""map2tod operation. For tiled maps, the map should be in work distribution,
+		as returned by unzip. Adds into tod."""
+		if id not in self.data: return # Should this really skip silently like this?
+		if tmul != 1: tod *= tmul
+		if mmul != 1: map = map*mmul
+		self.data[id].pmap.forward(tod, map)
+	def backward(self, id, tod, map, tmul=1, mmul=1):
+		"""tod2map operation. For tiled maps, the map should be in work distribution,
+		as returned by unzip. Adds into map"""
+		if id not in self.data: return
+		if tmul != 1: tod  = tod*tmul
+		if mmul != 1: map *= mmul
+		self.data[id].pmap.backward(tod, map)
+	def precon(self, map):
+		return self.idiv * map
+	def to_work(self, map):
+		return map.copy()
+	def from_work(self, map):
+		if self.comm is None: return map
+		else: return utils.allreduce(map, self.comm)
+	def write(self, prefix, tag, m):
+		if not self.output: return
+		oname = self.ofmt.format(name=self.name)
+		oname = "%s%s_%s.%s" % (prefix, oname, tag, self.ext)
+		if self.comm is None or self.comm.rank == 0:
+			enmap.write_map(oname, m[...,:self.ishape[-2],:self.ishape[-1]])
+		return oname
+
 class SignalCut(Signal):
 	def __init__(self, comm, name="cut", ofmt="{name}_{rank:02}", dtype=np.float32,
 			output=False, cut_type=None):
@@ -627,7 +870,7 @@ class SignalCut(Signal):
 		obs_div = np.ones(pcut.njunk, self.dtype)
 		Nd[:]   = 0
 		pcut.forward(Nd, obs_div)
-		Nd     *= nmat.ivar[:,None]
+		nmat.white(Nd)
 		pcut.backward(Nd, obs_div)
 		self.data[id] = bunch.Bunch(pcut=pcut, i1=self.off, i2=self.off+pcut.njunk)
 		self.off += pcut.njunk
@@ -706,6 +949,10 @@ class MLMapmaker:
 			except Exception as e:
 				msg = f"FAILED to build a noise model for observation='{id}' : '{e}'"
 				raise RuntimeError(msg)
+
+		moo = nmat.white(tod.copy())
+		print("ntest %15.7e %15.7e" % (np.std(np.gradient(tod,1)), np.std(np.gradient(moo,1))))
+
 		print("F", so3g.useful_info()["omp_num_threads"])
 		t4 = time.time()
 		# And apply it to the tod
@@ -771,6 +1018,57 @@ class MLMapmaker:
 			t2 = time.time()
 			yield bunch.Bunch(i=solver.i, err=solver.err, x=x, t=t2-t1)
 
+
+class PmatMapGpu:
+	def __init__(self, shape, wcs, ctime, bore, offs, polang, ncomp=3, dtype=np.float32):
+		self.shape = shape
+		print(shape)
+		self.wcs   = wcs
+		self.ctime = ctime
+		self.bore  = bore
+		self.offs  = offs
+		self.polang= polang
+		self.dtype = dtype
+		self.ncomp = ncomp
+		# Will expand pointing on the fly later, but for now precompute here
+		pos  = cupy.array(pointing.calc_pointing(ctime, bore, offs, polang, dtype=dtype)) # [{dec,ra,c,s}]
+		#np.save("test2.npy", pos[:,0].get())
+		#np.save("test3.npy", bore)
+		# Kendrick's pointing expects [{y,x,psi},ndet,nsamp]
+		p0 = cupy.array(enmap.pix2sky(shape, wcs, [0,0]))
+		dp = cupy.array(wcs.wcs.cdelt[::-1]*utils.degree)
+		pos[:2] -= p0[:,None,None]
+		pos[:2] /= dp[:,None,None]
+		pos[2]   = cupy.arctan2(pos[3],pos[2])/2
+		self.pointing = pos[:3]
+		#np.save("test.npy", self.pointing[:,0].get())
+		#1/0
+		# Precompute a pointing plan. This is slow, and uses quite a bit of
+		# memory, but will be changed later
+		self.plan = gpu_mm.PointingPlan(self.pointing.get(), self.shape[-2], self.shape[-1])
+	def forward(self, tod, map):
+		# For now transfer the tod and map each time. Later these will stay on the
+		# gpu as long as possible
+		gtod = cupy.zeros(tod.shape, tod.dtype)
+		gmap = cupy.array(map).astype(cupy.float32, copy=False)
+		gpu_mm.gpu_map2tod(gtod, gmap, self.pointing)
+		tod += gtod.get()
+		return tod
+	def backward(self, tod, map=None):
+		if map is None:
+			map = enmap.zeros((self.ncomp,)+self.shape[-2:], self.wcs, self.dtype)
+		gtod = cupy.array(tod)
+		gmap = cupy.zeros(map.shape, cupy.float32)
+		#gmap = cupy.array(map).astype(cupy.float32, copy=False)
+		gpu_mm.gpu_tod2map(gmap, gtod, self.pointing, self.plan)
+		map += gmap.get()
+		return map
+	#def backward(self, tod, map=None):
+	#	if map is None:
+	#		map = enmap.zeros((self.ncomp,)+self.shape[-2:], self.wcs, self.dtype)
+	#	gpu_mm.reference_tod2map(map, tod, self.pointing.get())
+	#	return map
+
 if __name__ == "__main__":
 	print("A", so3g.useful_info()["omp_num_threads"])
 
@@ -786,11 +1084,12 @@ if __name__ == "__main__":
 	if args.prefix: prefix += args.prefix + "_"
 	utils.mkdir(args.odir)
 	# Set up the signals we will solve for
-	signal_map = SignalMap(shape, wcs, comm, dtype=dtype_map)
+	#signal_map = SignalMap(shape, wcs, comm, dtype=dtype_map)
+	signal_map = SignalMapGpu(shape, wcs, comm, dtype=np.float32)
 	signal_cut = SignalCut(comm)
 	print("B", so3g.useful_info()["omp_num_threads"])
 	# Set up the mapmaker
-	mapmaker = MLMapmaker(signals=[signal_cut,signal_map], dtype=dtype_tod, verbose=True, noise_model=NmatDetvecs())
+	mapmaker = MLMapmaker(signals=[signal_cut,signal_map], dtype=dtype_tod, verbose=True, noise_model=NmatDetvecsGpu())
 	print("C", so3g.useful_info()["omp_num_threads"])
 	# Add our observations
 	for ind in range(comm.rank, nfile, comm.size):
@@ -806,6 +1105,9 @@ if __name__ == "__main__":
 	# Solve the equation system
 	for step in mapmaker.solve():
 		L.print("CG %4d %15.7e (%6.3f s)" % (step.i, step.err, step.t), id=0, level=1, color=colors.lgreen)
+		v = step.x[1]
+		v = v[v!=0]
+		print(np.median(v[::10]**2))
 		if step.i % 10 == 0:
 			for signal, val in zip(mapmaker.signals, step.x):
 				if signal.output:
