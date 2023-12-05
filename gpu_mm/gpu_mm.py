@@ -171,12 +171,12 @@ def gpu_map2tod(tod_out, map_in, xpointing):
 ####################################################################################################
 
 
-def reference_tod2map(map_out, tod_in, xpointing):
+def reference_tod2map(map_accum, tod_in, xpointing):
     """
     Slow (single-threaded CPU) reference implementation of tod2map().
+    The result of the "tod2map" operation will be accumulated to the 'map_accum' array.
 
-    map_out: float32 numpy array of shape (3, ndec, nra).
-        This array gets overwritten by reference_map2tod().
+    map_accum: float32 numpy array of shape (3, ndec, nra).
         Current implementation asserts (ndec % 64) == (nra % 64) == 0.
         The length-3 axis is {I,Q,U}.
 
@@ -200,21 +200,21 @@ def reference_tod2map(map_out, tod_in, xpointing):
         ('xpointing' is short for "exploded pointing", i.e. per-detector pointing)
     """
 
-    check_tmx_args('reference_tod2map()', tod_in, map_out, xpointing, gpu=False)
+    check_tmx_args('reference_tod2map()', tod_in, map_accum, xpointing, gpu=False)
     
     ndet, nt = tod_in.shape
-    ndec, nra = map_out.shape[1:]
+    ndec, nra = map_accum.shape[1:]
 
     # _reference_tod2map(map, tod, xpointing, ndet, nt, ndec, nra)
-    _reference_tod2map(map_out.ctypes.data, tod_in.ctypes.data, xpointing.ctypes.data, ndet, nt, ndec, nra)
+    _reference_tod2map(map_accum.ctypes.data, tod_in.ctypes.data, xpointing.ctypes.data, ndet, nt, ndec, nra)
 
 
-def gpu_tod2map(map_out, tod_in, xpointing, plan):
+def gpu_tod2map(map_accum, tod_in, xpointing, plan):
     """
     GPU implementation of tod2map().
+    The result of the "tod2map" operation will be accumulated to the 'map_accum' array.
 
-    map_out: float32 numpy array of shape (3, ndec, nra).
-        This array gets overwritten by gpu_map2tod().
+    map_accum: float32 numpy array of shape (3, ndec, nra).
         Current implementation asserts (ndec % 64) == (nra % 64) == 0.
         The length-3 axis is {I,Q,U}.
 
@@ -241,18 +241,18 @@ def gpu_tod2map(map_out, tod_in, xpointing, plan):
     """
 
     assert isinstance(plan, PointingPlan)
-    check_tmx_args('gpu_tod2map()', tod_in, map_out, xpointing, gpu=True)
+    check_tmx_args('gpu_tod2map()', tod_in, map_accum, xpointing, gpu=True)
 
     # Check consistency between plan and tod/map args
     assert plan.ncl_uninflated == ((tod_in.shape[0] * tod_in.shape[1]) // 32)
-    assert plan.ndec == map_out.shape[1]
-    assert plan.nra == map_out.shape[2]
+    assert plan.ndec == map_accum.shape[1]
+    assert plan.nra == map_accum.shape[2]
     
     ndet, nt = tod_in.shape
-    ndec, nra = map_out.shape[1:]
+    ndec, nra = map_accum.shape[1:]
 
     # _gpu_tod2map(map, tod, xpointing, plan_cltod_list, plan_quadruples, plan_ncltod, plan_nquadruples, ndet, nt, ndec, nra)
-    _gpu_tod2map(map_out.data.ptr, tod_in.data.ptr, xpointing.data.ptr,
+    _gpu_tod2map(map_accum.data.ptr, tod_in.data.ptr, xpointing.data.ptr,
                  plan.cltod_list.data.ptr, plan.quadruples.data.ptr,
                  plan.ncl_inflated, plan.num_quadruples, ndet, nt, ndec, nra)
 

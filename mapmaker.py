@@ -71,6 +71,26 @@ class PmatCut:
 		junk = np.empty(self.njunk, tod.dtype)
 		so3g.process_cuts(self.cuts.ranges, "clear", self.model, self.params, tod, junk)
 
+class PmatCutGpu:
+	"""Implementation of cuts-as-extra-degrees-of-freedom for a single obs."""
+	def __init__(self, cuts, model=None, params={"resolution":100, "nmax":100}):
+		self.cuts   = cuts
+		self.model  = model or "full"
+		self.params = params
+		# FIXME
+		self.njunk  = 1
+	def forward(self, tod, junk):
+		"""Project from the cut parameter (junk) space for this scan to tod."""
+		# FIXME
+		pass
+	def backward(self, tod, junk):
+		"""Project from tod to cut parameters (junk) for this scan."""
+		# FIXME
+		pass
+		self.clear(tod)
+	def clear(self, tod):
+		pass
+
 class ArrayZipper:
 	def __init__(self, shape, dtype, comm=None):
 		self.shape = shape
@@ -396,23 +416,42 @@ class NmatDetvecsGpu(Nmat):
 		return nmat
 	def apply(self, tod, inplace=True):
 		ap  = anypy(self.D)
+		t1 = time.time()
 		gtod= ap.array(tod)
+		cupy.cuda.runtime.deviceSynchronize()
+		t2 = time.time()
 		apply_window(gtod, self.nwin)
+		cupy.cuda.runtime.deviceSynchronize()
+		t3 = time.time()
 		ft = ap.fft.rfft(gtod, axis=1)
+		cupy.cuda.runtime.deviceSynchronize()
+		t4 = time.time()
 		# If we don't cast to real here, we get the same result but much slower
 		rft = ft.view(gtod.dtype)
 		for i, (b1,b2) in enumerate(self.bins*2):
 			# N  = D + VEV'
 			# N" = D" - D"V(E"+V'DV)"V'D"
-			# We want N"ft
 			iA   = 1/self.D[i,:]
 			core = ap.linalg.inv(ap.diag(1/self.E[i]) + self.V.T @ (iA[:,None]*self.V))
 			iAd  = iA[:,None]*rft[:,b1:b2]
 			rft[:,b1:b2] = iAd - iA[:,None] * (self.V @ core @ self.V.T @ iAd)
+		cupy.cuda.runtime.deviceSynchronize()
+		t5 = time.time()
 		gtod[:]=ap.fft.irfft(ft,axis=1,n=tod.shape[1],norm="forward")
+		cupy.cuda.runtime.deviceSynchronize()
+		t6 = time.time()
 		apply_window(gtod, self.nwin)
-		if inplace: tod[:] = gtod.get()
-		else: tod = gtod.get()
+		cupy.cuda.runtime.deviceSynchronize()
+		t7 = time.time()
+		if isinstance(tod, np.ndarray):
+			if inplace: tod[:] = gtod.get()
+			else: tod = gtod.get()
+		else:
+			if inplace:
+				tod[:] = gtod
+		cupy.cuda.runtime.deviceSynchronize()
+		t8 = time.time()
+		L.print("iN sub tf %6.4f win %6.4f fft %6.4f mats %6.4f ifft %6.4f win %6.4f tf %6.4f" % (t2-t1,t3-t2,t4-t3,t5-t4,t6-t5,t7-t6,t8-t7), level=3)
 		return tod
 	def white(self, tod, inplace=True):
 		ap   = anypy(self.D)
@@ -420,9 +459,11 @@ class NmatDetvecsGpu(Nmat):
 		apply_window(gtod, self.nwin)
 		gtod *= self.ivar[:,None]
 		apply_window(gtod, self.nwin)
-		if inplace: tod[:] = gtod.get()
-		else: tod = gtod.get()
-		print("ivar gtod", np.std(tod))
+		if isinstance(tod, np.ndarray):
+			if inplace: tod[:] = gtod.get()
+			else: tod = gtod.get()
+		else:
+			if inplace: tod[:] = gtod
 		return tod
 	def write(self, fname):
 		data = bunch.Bunch(type="NmatDetvecsGpu")
@@ -763,12 +804,12 @@ class SignalMapGpu(Signal):
 		nmat a noise model, representing the inverse noise covariance matrix,
 		and Nd the result of applying the noise model to the detector time-ordered data.
 		"""
-		Nd	 = Nd.copy() # This copy can be avoided if build_obs is split into two parts
+		Nd     = Nd.copy() # This copy can be avoided if build_obs is split into two parts
 		ctime  = obs.ctime
 		t1     = time.time()
-		pcut   = PmatCut(obs.cuts) # could pass this in, but fast to construct
+		pcut   = PmatCutGpu(obs.cuts) # could pass this in, but fast to construct
 		if pmap is None:
-			pmap = PmatMapGpu(self.rhs.shape, self.rhs.wcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, dtype=obs.tod.dtype)
+			pmap = PmatMapGpu(self.rhs.shape, self.rhs.wcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, dtype=Nd.dtype)
 		# Build the RHS for this observation
 		t2 = time.time()
 		pcut.clear(Nd)
@@ -777,7 +818,7 @@ class SignalMapGpu(Signal):
 		# Build the per-pixel inverse variance for this observation.
 		# This will be scalar to make the preconditioner fast, but uses
 		# ncomp while building since pmat expects that
-		ones         = np.zeros_like(obs_rhs)
+		ones         = cupy.zeros_like(obs_rhs)
 		ones[0]      = 1
 		Nd[:]        = 0
 		pmap.forward(Nd, ones)
@@ -793,9 +834,12 @@ class SignalMapGpu(Signal):
 		t5 = time.time()
 		del Nd, ones
 		# Update our full rhs and div. This works for both plain and distributed maps
-		self.rhs = self.rhs .insert(obs_rhs, op=np.ndarray.__iadd__)
-		self.div = self.div .insert(obs_div, op=np.ndarray.__iadd__)
-		self.hits= self.hits.insert(obs_hits,op=np.ndarray.__iadd__)
+		obs_rhs  = enmap.ndmap(obs_rhs .get(), self.rhs.wcs)
+		obs_div  = enmap.ndmap(obs_div .get(), self.rhs.wcs)
+		obs_hits = enmap.ndmap(obs_hits.get(), self.rhs.wcs)
+		self.rhs = self.rhs .insert(obs_rhs , op=np.ndarray.__iadd__)
+		self.div = self.div .insert(obs_div , op=np.ndarray.__iadd__)
+		self.hits= self.hits.insert(obs_hits, op=np.ndarray.__iadd__)
 		t6 = time.time()
 		L.print("Init map pmat %6.3f rhs %6.3f div %6.3f hit %6.3f add %6.3f %s" % (t2-t1,t3-t2,t4-t3,t5-t4,t6-t5,id), level=2)
 		# Save the per-obs things we need. Just the pointing matrix in our case.
@@ -816,25 +860,26 @@ class SignalMapGpu(Signal):
 		t2 = time.time()
 		L.print("Prep map %6.3f" % (t2-t1), level=2)
 		self.ready = True
-	def forward(self, id, tod, map, tmul=1, mmul=1):
+	def forward(self, id, gtod, gmap, tmul=1, mmul=1):
 		"""map2tod operation. For tiled maps, the map should be in work distribution,
 		as returned by unzip. Adds into tod."""
 		if id not in self.data: return # Should this really skip silently like this?
-		if tmul != 1: tod *= tmul
-		if mmul != 1: map = map*mmul
-		self.data[id].pmap.forward(tod, map)
-	def backward(self, id, tod, map, tmul=1, mmul=1):
+		if tmul != 1: gtod *= tmul
+		if mmul != 1: gmap = gmap*mmul
+		self.data[id].pmap.forward(gtod, gmap)
+	def backward(self, id, gtod, gmap, tmul=1, mmul=1):
 		"""tod2map operation. For tiled maps, the map should be in work distribution,
 		as returned by unzip. Adds into map"""
 		if id not in self.data: return
-		if tmul != 1: tod  = tod*tmul
-		if mmul != 1: map *= mmul
-		self.data[id].pmap.backward(tod, map)
+		if tmul != 1: gtod  = gtod*tmul
+		if mmul != 1: gmap *= mmul
+		self.data[id].pmap.backward(gtod, gmap)
 	def precon(self, map):
 		return self.idiv * map
 	def to_work(self, map):
-		return map.copy()
-	def from_work(self, map):
+		return cupy.array(map)
+	def from_work(self, gmap):
+		map = enmap.enmap(gmap.get(), self.rhs.wcs, self.rhs.dtype, copy=False)
 		if self.comm is None: return map
 		else: return utils.allreduce(map, self.comm)
 	def write(self, prefix, tag, m):
@@ -906,9 +951,72 @@ class SignalCut(Signal):
 			hfile["data"] = m
 		return oname
 
+class SignalCutGpu(Signal):
+	# Placeholder for when we have a gpu implementation
+	def __init__(self, comm, name="cut", ofmt="{name}_{rank:02}", dtype=np.float32,
+			output=False, cut_type=None):
+		"""Signal for handling the ML solution for the values of the cut samples."""
+		Signal.__init__(self, name, ofmt, output, ext="hdf")
+		self.comm  = comm
+		self.data  = {}
+		self.dtype = dtype
+		self.cut_type = cut_type
+		self.off   = 0
+		self.rhs   = []
+		self.div   = []
+	def add_obs(self, id, obs, nmat, Nd):
+		"""Add and process an observation. "obs" should be an Observation axis manager,
+		nmat a noise model, representing the inverse noise covariance matrix,
+		and Nd the result of applying the noise model to the detector time-ordered data."""
+		Nd      = Nd.copy() # This copy can be avoided if build_obs is split into two parts
+		pcut    = PmatCutGpu(obs.cuts, model=self.cut_type)
+		# Build our RHS
+		obs_rhs = cupy.zeros(pcut.njunk, self.dtype)
+		pcut.backward(Nd, obs_rhs)
+		# Build our per-pixel inverse covmat
+		obs_div = cupy.ones(pcut.njunk, self.dtype)
+		Nd[:]   = 0
+		pcut.forward(Nd, obs_div)
+		nmat.white(Nd)
+		pcut.backward(Nd, obs_div)
+		self.data[id] = bunch.Bunch(pcut=pcut, i1=self.off, i2=self.off+pcut.njunk)
+		self.off += pcut.njunk
+		self.rhs.append(obs_rhs.get())
+		self.div.append(obs_div.get())
+	def prepare(self):
+		"""Process the added observations, determining our degrees of freedom etc.
+		Should be done before calling forward and backward."""
+		if self.ready: return
+		self.rhs = np.concatenate(self.rhs)
+		self.div = np.concatenate(self.div)
+		self.dof = ArrayZipper(self.rhs.shape, dtype=self.dtype, comm=self.comm)
+		self.ready = True
+	def forward(self, id, gtod, gjunk):
+		if id not in self.data: return
+		d = self.data[id]
+		d.pcut.forward(gtod, gjunk[d.i1:d.i2])
+	def precon(self, junk):
+		return junk/self.div
+	def backward(self, id, gtod, gjunk):
+		if id not in self.data: return
+		d = self.data[id]
+		d.pcut.backward(gtod, gjunk[d.i1:d.i2])
+	def to_work  (self, x): return cupy.array(x)
+	def from_work(self, x): return x.get()
+	def write(self, prefix, tag, m):
+		if not self.output: return
+		if self.comm is None:
+			rank = 0
+		else:
+			rank = self.comm.rank
+		oname = self.ofmt.format(name=self.name, rank=rank)
+		oname = "%s%s_%s.%s" % (prefix, oname, tag, self.ext)
+		with h5py.File(oname, "w") as hfile:
+			hfile["data"] = m
+		return oname
 
 class MLMapmaker:
-	def __init__(self, signals=[], noise_model=None, dtype=np.float32, verbose=False):
+	def __init__(self, signals=[], noise_model=None, dtype=np.float32, verbose=False, mode="gpu"):
 		"""Initialize a Maximum Likelihood Mapmaker.
 		Arguments:
 		* signals: List of Signal-objects representing the models that will be solved
@@ -926,9 +1034,11 @@ class MLMapmaker:
 		self.data     = []
 		self.dof      = MultiZipper()
 		self.ready    = False
+		self.mode     = mode
 	def add_obs(self, id, obs, deslope=True, noise_model=None):
 		# Prepare our tod
 		t1 = time.time()
+		ap     = cupy if self.mode == "gpu" else np
 		ctime  = obs.ctime
 		srate  = (len(ctime)-1)/(ctime[-1]-ctime[0])
 		tod    = obs.tod.astype(self.dtype, copy=False)
@@ -936,7 +1046,8 @@ class MLMapmaker:
 		if deslope:
 			utils.deslope(tod, w=5, inplace=True)
 		t3 = time.time()
-		print("E", so3g.useful_info()["omp_num_threads"])
+		gtod = ap.array(tod)
+		del tod
 		# Allow the user to override the noise model on a per-obs level
 		if noise_model is None: noise_model = self.noise_model
 		# Build the noise model from the obs unless a fully
@@ -945,23 +1056,19 @@ class MLMapmaker:
 			nmat = noise_model
 		else:
 			try:
-				nmat = noise_model.build(tod, srate=srate)
+				nmat = noise_model.build(gtod, srate=srate)
 			except Exception as e:
 				msg = f"FAILED to build a noise model for observation='{id}' : '{e}'"
 				raise RuntimeError(msg)
-
-		moo = nmat.white(tod.copy())
-		print("ntest %15.7e %15.7e" % (np.std(np.gradient(tod,1)), np.std(np.gradient(moo,1))))
-
 		print("F", so3g.useful_info()["omp_num_threads"])
 		t4 = time.time()
 		# And apply it to the tod
-		tod = nmat.apply(tod)
+		gtod = nmat.apply(gtod)
 		t5 = time.time()
 		print("G", so3g.useful_info()["omp_num_threads"])
 		# Add the observation to each of our signals
 		for signal in self.signals:
-			signal.add_obs(id, obs, nmat, tod)
+			signal.add_obs(id, obs, nmat, gtod)
 		t6 = time.time()
 		L.print("Init sys trun %6.3f ds %6.3f Nb %6.3f N %6.3f add sigs %6.3f %s" % (t2-t1, t3-t2, t4-t3, t5-t4, t6-t5, id), level=2)
 		# Save only what we need about this observation
@@ -980,19 +1087,20 @@ class MLMapmaker:
 		t1 = time.time()
 		iwork = [signal.to_work(m) for signal,m in zip(self.signals,self.dof.unzip(x))]
 		owork = [w*0 for w in iwork]
+		ap    = anypy(iwork[0])
 		t2 = time.time()
 		for di, data in enumerate(self.data):
 			# This is the main place that needs to change for the GPU implementation
 			ta1 = time.time()
-			tod = np.zeros([data.ndet, data.nsamp], self.dtype)
+			gtod= ap.zeros([data.ndet, data.nsamp], self.dtype)
 			ta2 = time.time()
 			for si, signal in reversed(list(enumerate(self.signals))):
-				signal.forward(data.id, tod, iwork[si])
+				signal.forward(data.id, gtod, iwork[si])
 			ta3 = time.time()
-			data.nmat.apply(tod)
+			data.nmat.apply(gtod)
 			ta4 = time.time()
 			for si, signal in enumerate(self.signals):
-				signal.backward(data.id, tod, owork[si])
+				signal.backward(data.id, gtod, owork[si])
 			ta5 = time.time()
 			L.print("A z %6.3f P %6.3f N %6.3f P' %6.3f %s" % (ta2-ta1, ta3-ta2, ta4-ta3, ta5-ta4, data.id), level=2)
 		t3 = time.time()
@@ -1017,7 +1125,6 @@ class MLMapmaker:
 			x  = self.dof.unzip(solver.x)
 			t2 = time.time()
 			yield bunch.Bunch(i=solver.i, err=solver.err, x=x, t=t2-t1)
-
 
 class PmatMapGpu:
 	def __init__(self, shape, wcs, ctime, bore, offs, polang, ncomp=3, dtype=np.float32):
@@ -1046,28 +1153,32 @@ class PmatMapGpu:
 		# Precompute a pointing plan. This is slow, and uses quite a bit of
 		# memory, but will be changed later
 		self.plan = gpu_mm.PointingPlan(self.pointing.get(), self.shape[-2], self.shape[-1])
-	def forward(self, tod, map):
+	def forward(self, gtod, gmap):
 		# For now transfer the tod and map each time. Later these will stay on the
 		# gpu as long as possible
-		gtod = cupy.zeros(tod.shape, tod.dtype)
-		gmap = cupy.array(map).astype(cupy.float32, copy=False)
+		t1 = time.time()
+		cupy.cuda.runtime.deviceSynchronize()
+		t2 = time.time()
 		gpu_mm.gpu_map2tod(gtod, gmap, self.pointing)
-		tod += gtod.get()
-		return tod
-	def backward(self, tod, map=None):
-		if map is None:
-			map = enmap.zeros((self.ncomp,)+self.shape[-2:], self.wcs, self.dtype)
-		gtod = cupy.array(tod)
-		gmap = cupy.zeros(map.shape, cupy.float32)
-		#gmap = cupy.array(map).astype(cupy.float32, copy=False)
+		cupy.cuda.runtime.deviceSynchronize()
+		t3 = time.time()
+		cupy.cuda.runtime.deviceSynchronize()
+		t4 = time.time()
+		L.print("Pcore tf %6.4f gpu %6.4f tf %6.4f" % (t2-t1,t3-t2,t4-t3), level=3)
+		return gtod
+	def backward(self, gtod, gmap=None):
+		if gmap is None:
+			gmap = cupy.zeros((self.ncomp,)+self.shape[-2:], self.dtype)
+		t1 = time.time()
+		cupy.cuda.runtime.deviceSynchronize()
+		t2 = time.time()
 		gpu_mm.gpu_tod2map(gmap, gtod, self.pointing, self.plan)
-		map += gmap.get()
-		return map
-	#def backward(self, tod, map=None):
-	#	if map is None:
-	#		map = enmap.zeros((self.ncomp,)+self.shape[-2:], self.wcs, self.dtype)
-	#	gpu_mm.reference_tod2map(map, tod, self.pointing.get())
-	#	return map
+		cupy.cuda.runtime.deviceSynchronize()
+		t3 = time.time()
+		cupy.cuda.runtime.deviceSynchronize()
+		t4 = time.time()
+		L.print("P'core tf %6.4f gpu %6.4f tf %6.4f" % (t2-t1,t3-t2,t4-t3), level=3)
+		return gmap
 
 if __name__ == "__main__":
 	print("A", so3g.useful_info()["omp_num_threads"])
@@ -1076,7 +1187,7 @@ if __name__ == "__main__":
 	nfile  = len(ifiles)
 	comm   = mpi.COMM_WORLD
 	dtype_tod = np.float32
-	dtype_map = np.float64
+	dtype_map = np.float32
 	shape, wcs = enmap.read_map_geometry(args.area)
 	L      = Logger(id=comm.rank, level=args.verbose-args.quiet)
 	L.print("Mapping %d tods with %d mpi tasks" % (nfile, comm.size), level=0, id=0, color=colors.lgreen)
@@ -1086,7 +1197,7 @@ if __name__ == "__main__":
 	# Set up the signals we will solve for
 	#signal_map = SignalMap(shape, wcs, comm, dtype=dtype_map)
 	signal_map = SignalMapGpu(shape, wcs, comm, dtype=np.float32)
-	signal_cut = SignalCut(comm)
+	signal_cut = SignalCutGpu(comm)
 	print("B", so3g.useful_info()["omp_num_threads"])
 	# Set up the mapmaker
 	mapmaker = MLMapmaker(signals=[signal_cut,signal_map], dtype=dtype_tod, verbose=True, noise_model=NmatDetvecsGpu())
@@ -1105,9 +1216,6 @@ if __name__ == "__main__":
 	# Solve the equation system
 	for step in mapmaker.solve():
 		L.print("CG %4d %15.7e (%6.3f s)" % (step.i, step.err, step.t), id=0, level=1, color=colors.lgreen)
-		v = step.x[1]
-		v = v[v!=0]
-		print(np.median(v[::10]**2))
 		if step.i % 10 == 0:
 			for signal, val in zip(mapmaker.signals, step.x):
 				if signal.output:
