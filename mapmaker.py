@@ -11,12 +11,13 @@ if __name__ == "__main__":
 	parser.add_argument("-q", "--quiet",   action="count", default=0)
 	args = parser.parse_args()
 
-import numpy as np, os, time
+import numpy as np, os, time, contextlib
 from pixell import enmap, utils, mpi, bunch, fft, colors, memory
 import so3g, cupy
 from sotodlib import coords
 import pointing, gpu_mm
 mempool = cupy.get_default_memory_pool()
+scratch = bunch.Bunch()
 
 def read_tod(fname, mul=32):
 	"""Read a tod file in the simple npz format we use"""
@@ -37,8 +38,8 @@ def read_tod(fname, mul=32):
 	print("nsamp %d primes %s" % (res.tod.shape[1], utils.primes(res.tod.shape[1])))
 	return res
 
-def round_up  (n, b): return (np.array(n)+b-1)//b*b
-def round_down(n, b): return np.array(n)//b*b
+def round_up  (n, b): return (n+b-1)//b*b
+def round_down(n, b): return n//b*b
 
 def mask2cuts(mask):
 	return so3g.proj.ranges.RangesMatrix.from_mask(mask)
@@ -46,6 +47,45 @@ def mask2cuts(mask):
 def cutime():
 	cupy.cuda.runtime.deviceSynchronize()
 	return time.time()
+
+def gpu_garbage_collect():
+	mempool.free_all_blocks()
+
+class CuBuffer:
+	def __init__(self, size, align=512, name="[unnamed]"):
+		self.size   = int(size)
+		self.memptr = mempool.malloc(self.size)
+		self.offset = 0
+		self.align  = align
+		self.name   = name
+	def free(self): return self.size - self.offset
+	def view(self, shape, dtype=np.float32):
+		return cupy.ndarray(shape, dtype, memptr=cupy.cuda.MemoryPointer(self.memptr.mem, self.offset))
+	def copy(self, arr):
+		if self.free() < arr.nbytes: raise MemoryError("CuBuffer too small to copy array with size %d" % arr.nbytes)
+		res = self.view(arr.shape, arr.dtype)
+		if isinstance(arr, cupy.ndarray):
+			cupy.cuda.runtime.memcpy(res.data.ptr, arr.data.ptr, arr.nbytes, cupy.cuda.runtime.memcpyDefault)
+		else:
+			cupy.cuda.runtime.memcpy(res.data.ptr, arr.ctypes.data, arr.nbytes, cupy.cuda.runtime.memcpyDefault)
+		return res
+	def alloc(self, size):
+		#print("CuBuffer %s alloc %d offset %d" % (self.name, size, self.offset))
+		if self.free() < size:
+			raise MemoryError("CuBuffer not enough memory to allocate %d bytes" % size)
+		res = cupy.cuda.MemoryPointer(self.memptr.mem, self.offset)
+		self.offset = round_up(self.offset+size, self.align)
+		return res
+	def reset(self):
+		self.offset = 0
+	@contextlib.contextmanager
+	def as_allocator(self):
+		offset = self.offset
+		try:
+			with cupy.cuda.using_allocator(self.alloc):
+				yield
+		finally:
+			self.offset = offset
 
 class Logger:
 	def __init__(self, level=0, id=0, fmt="{id:3d} {t:6.2f} {mem:6.2f} {gmem:6.2f} {msg:s}"):
@@ -354,7 +394,7 @@ class NmatDetvecs(Nmat):
 class NmatDetvecsGpu(Nmat):
 	def __init__(self, bin_edges=None, eig_lim=16, single_lim=0.55, mode_bins=[0.25,4.0,20],
 			downweight=[], window=2, nwin=None, verbose=False, bins=None, D=None, V=None, E=None, ivar=None,
-			nstream=100):
+			nstream=1):
 		# Variables used for building the noise model
 		if bin_edges is None: bin_edges = np.array([
 			0.16, 0.25, 0.35, 0.45, 0.55, 0.70, 0.85, 1.00,
@@ -399,7 +439,7 @@ class NmatDetvecsGpu(Nmat):
 		if np.any(np.diff(mode_bins) < 0):
 			raise RuntimeError(f"At least one of the frequency bins has a negative range: \n{mode_bins}")
 		# Then use these to get our set of basis vectors
-		V = find_modes_jon(ft, mode_bins, eig_lim=self.eig_lim, single_lim=self.single_lim, verbose=self.verbose)
+		V = find_modes_jon(ft, mode_bins, eig_lim=self.eig_lim, single_lim=self.single_lim, verbose=self.verbose, dtype=dtype)
 		nmode= V.shape[1]
 		if V.size == 0: raise errors.ModelError("Could not find any noise modes")
 		# Cut bins that extend beyond our max frequency
@@ -432,7 +472,8 @@ class NmatDetvecsGpu(Nmat):
 		if not inplace: god = gtod.copy()
 		apply_window(gtod, self.nwin)
 		t2 = cutime()
-		ft = cupy.fft.rfft(gtod, axis=1)
+		with scratch.ft.as_allocator():
+			ft = cupy.fft.rfft(gtod, axis=1)
 		# If we don't cast to real here, we get the same result but much slower
 		rft = ft.view(gtod.dtype)
 		t3 = cutime()
@@ -440,13 +481,25 @@ class NmatDetvecsGpu(Nmat):
 			# N  = D + VEV'
 			# N" = D" - D"V(E"+V'DV)"V'D"
 			with self.streams[i%len(self.streams)] as s:
-				iA   = 1/self.D[i,:]
-				core = cupy.linalg.inv(cupy.diag(1/self.E[i]) + self.V.T @ (iA[:,None]*self.V))
-				iAd  = iA[:,None]*rft[:,b1:b2]
-				rft[:,b1:b2] = iAd - iA[:,None] * ((self.V @ core) @ (self.V.T @ iAd))
+				#iA   = 1/self.D[i,:]
+				#core = cupy.linalg.inv(cupy.diag(1/self.E[i]) + self.V.T @ (iA[:,None]*self.V))
+				#iAd  = iA[:,None]*rft[:,b1:b2]
+				#rft[:,b1:b2] = iAd - iA[:,None] * ((self.V @ core) @ (self.V.T @ iAd))
+				with scratch.nmat_work.as_allocator():
+					iA   = 1/self.D[i,:]
+					core = cupy.linalg.inv(cupy.diag(1/self.E[i]) + self.V.T @ (iA[:,None]*self.V))
+					iAd  = iA[:,None]*rft[:,b1:b2]
+					#rft[:,b1:b2] = iAd - iA[:,None] * ((self.V @ core) @ (self.V.T @ iAd))
+					rft[:,b1:b2] = iAd
+					tmp  = self.V.T @ iAd
+					core.dot(tmp, out=tmp)
+					self.V.dot(tmp, out=iAd)
+					iAd *= iA[:,None]
+					rft[:,b1:b2] -= iAd
 		cupy.cuda.runtime.deviceSynchronize()
 		t4 = cutime()
-		gtod[:]=cupy.fft.irfft(ft,axis=1,n=gtod.shape[1],norm="forward")
+		with scratch.tod2.as_allocator():
+			gtod[:]=cupy.fft.irfft(ft,axis=1,n=gtod.shape[1],norm="forward")
 		t5 = cutime()
 		apply_window(gtod, self.nwin)
 		t6 = cutime()
@@ -520,16 +573,16 @@ def mycontiguous(a):
 	b[...] = a[...]
 	return b
 
-def find_modes_jon(ft, bins, eig_lim=None, single_lim=0, skip_mean=False, verbose=False):
+def find_modes_jon(ft, bins, eig_lim=None, single_lim=0, skip_mean=False, verbose=False, dtype=np.float32):
 	ap   = anypy(ft)
 	ndet = ft.shape[0]
-	vecs = ap.zeros([ndet,0])
+	vecs = ap.zeros([ndet,0],dtype=dtype)
 	if not skip_mean:
 		# Force the uniform common mode to be included. This
 		# assumes all the detectors have accurately measured gain.
 		# Forcing this avoids the possibility that we don't find
 		# any modes at all.
-		vecs = ap.concatenate([vecs,ap.full([ndet,1],ndet**-0.5)],1)
+		vecs = ap.concatenate([vecs,ap.full([ndet,1],ndet**-0.5,dtype=dtype)],1)
 	for bi, b in enumerate(bins):
 		d    = ft[:,b[0]:b[1]]
 		cov  = measure_cov(d)
@@ -776,7 +829,7 @@ class SignalMap(Signal):
 class SignalMapGpu(Signal):
 	"""Signal describing a non-distributed sky map."""
 	def __init__(self, shape, wcs, comm, name="sky", ofmt="{name}", output=True,
-			ext="fits", dtype=np.float32, sys=None, interpol=None):
+			ext="fits", dtype=np.float32, sys=None, interpol=None, scratch=None):
 		"""Signal describing a sky map in the coordinate system given by "sys", which defaults
 		to equatorial coordinates. If tiled==True, then this will be a distributed map with
 		the given tile_shape, otherwise it will be a plain enmap. interpol controls the
@@ -790,7 +843,7 @@ class SignalMapGpu(Signal):
 		self.comps = "TQU"
 		self.ncomp = 3
 		self.ishape= tuple(shape[-2:])
-		shape      = tuple(round_up(shape[-2:], 64))
+		shape      = tuple(round_up(np.array(shape[-2:]), 64))
 		self.rhs = enmap.zeros((self.ncomp,)+shape, wcs, dtype=dtype)
 		self.div = enmap.zeros(              shape, wcs, dtype=dtype)
 		self.hits= enmap.zeros(              shape, wcs, dtype=dtype)
@@ -856,18 +909,16 @@ class SignalMapGpu(Signal):
 		t2 = time.time()
 		L.print("Prep map %6.3f" % (t2-t1), level=2)
 		self.ready = True
-	def forward(self, id, gtod, gmap, tmul=1, mmul=1):
+	def forward(self, id, gtod, gmap, tmul=1):
 		"""map2tod operation. For tiled maps, the map should be in work distribution,
 		as returned by unzip. Adds into tod."""
 		if id not in self.data: return # Should this really skip silently like this?
 		if tmul != 1: gtod *= tmul
-		if mmul != 1: gmap = gmap*mmul
 		self.data[id].pmap.forward(gtod, gmap)
-	def backward(self, id, gtod, gmap, tmul=1, mmul=1):
+	def backward(self, id, gtod, gmap, mmul=1):
 		"""tod2map operation. For tiled maps, the map should be in work distribution,
 		as returned by unzip. Adds into map"""
 		if id not in self.data: return
-		if tmul != 1: gtod  = gtod*tmul
 		if mmul != 1: gmap *= mmul
 		self.data[id].pmap.backward(gtod, gmap)
 	def precalc_setup(self, id): self.data[id].pmap.precalc_setup()
@@ -875,7 +926,8 @@ class SignalMapGpu(Signal):
 	def precon(self, map):
 		return self.idiv * map
 	def to_work(self, map):
-		return cupy.array(map)
+		#return cupy.array(map)
+		return scratch.map.copy(map)
 	def from_work(self, gmap):
 		map = enmap.enmap(gmap.get(), self.rhs.wcs, self.rhs.dtype, copy=False)
 		if self.comm is None: return map
@@ -1088,7 +1140,8 @@ class MLMapmaker:
 		for di, data in enumerate(self.data):
 			# This is the main place that needs to change for the GPU implementation
 			ta1 = cutime()
-			gtod= ap.zeros([data.ndet, data.nsamp], self.dtype)
+			#gtod= ap.zeros([data.ndet, data.nsamp], self.dtype)
+			gtod = scratch.tod.view([data.ndet, data.nsamp], self.dtype)
 			ta2 = cutime()
 			for si, signal in reversed(list(enumerate(self.signals))):
 				signal.precalc_setup(data.id)
@@ -1100,7 +1153,9 @@ class MLMapmaker:
 				signal.backward(data.id, gtod, owork[si])
 				signal.precalc_free(data.id)
 			ta5 = cutime()
-			L.print("A z %6.3f P %6.3f N %6.3f P' %6.3f %s" % (ta2-ta1, ta3-ta2, ta4-ta3, ta5-ta4, data.id), level=2)
+			#gpu_garbage_collect()
+			ta6 = cutime()
+			L.print("A z %6.3f P %6.3f N %6.3f P' %6.3f gc %6.4f %s" % (ta2-ta1, ta3-ta2, ta4-ta3, ta5-ta4, ta6-ta5, data.id), level=2)
 		t3 = cutime()
 		result = self.dof.zip(*[signal.from_work(w) for signal,w in zip(self.signals,owork)])
 		t4 = cutime()
@@ -1216,16 +1271,16 @@ class PointingFit:
 			B = self.B if self.store_basis else self.basis(self.ref_pixs)
 		if coeffs is None:
 			coeffs = self.coeffs
-		return self.wrap(coeffs.dot(B))
+		#return self.wrap(coeffs.dot(B))
+		pointing = scratch.pointing.view(coeffs.shape[:-1]+B.shape[1:], B.dtype)
+		coeffs.dot(B, out=pointing)
+		pointing = self.wrap(pointing)
+		return pointing
 	def wrap(self, pixs):
-		# FIXME: handle samples that go off the edge of the map
-		# here if it hasn't been implemented in the pointing matrix yet
-		#print(utils.minmax(pixs.get(),(-2,-1)))
-		#print(self.shape)
-		pixs[0] = cupy.clip(pixs[0], 1, self.shape[-2]-2)
-		pixs[1] = cupy.clip(pixs[1], 1, self.shape[-1]-2)
+		# FIXME: Remove this when mapmaker handles this itself
+		cupy.clip(pixs[0], 1, self.shape[-2]-2, out=pixs[0])
+		cupy.clip(pixs[1], 1, self.shape[-1]-2, out=pixs[1])
 		return pixs
-
 
 class PmatMapGpu:
 	def __init__(self, shape, wcs, ctime, bore, offs, polang, ncomp=3, dtype=np.float32):
@@ -1273,8 +1328,17 @@ if __name__ == "__main__":
 	dtype_tod = np.float32
 	dtype_map = np.float32
 	shape, wcs = enmap.read_map_geometry(args.area)
+	# Set up our gpu scratch memory. These will be used for intermediate calculations.
+	# We do this instead of letting cupy allocate automatically because cupy garbage collection
+	# is too slow.
+	scratch.tod      = CuBuffer(1000*250000*4,     name="tod")
+	scratch.tod2     = CuBuffer(1000*250000*4*3,   name="tod2")
+	scratch.ft       = CuBuffer(1000*250000*4*2,   name="ft")
+	scratch.pointing = CuBuffer(3*1000*250000*4,   name="pointing")
+	scratch.map      = CuBuffer(3*shape[-2]*(shape[-1]+512)*4, name="map")
+	scratch.nmat_work= CuBuffer(40*1000*1000*4,    name="nmat_work")
 	# Disable the cufft cache. It uses too much gpu memory
-	cupy.fft.config.get_plan_cache().set_memsize(int(1e9))
+	cupy.fft.config.get_plan_cache().set_memsize(0)
 	L      = Logger(id=comm.rank, level=args.verbose-args.quiet)
 	L.print("Mapping %d tods with %d mpi tasks" % (nfile, comm.size), level=0, id=0, color=colors.lgreen)
 	prefix = args.odir + "/"
