@@ -1328,6 +1328,8 @@ if __name__ == "__main__":
 	dtype_tod = np.float32
 	dtype_map = np.float32
 	shape, wcs = enmap.read_map_geometry(args.area)
+	L      = Logger(id=comm.rank, level=args.verbose-args.quiet)
+	L.print("Init", level=0, id=0, color=colors.lgreen)
 	# Set up our gpu scratch memory. These will be used for intermediate calculations.
 	# We do this instead of letting cupy allocate automatically because cupy garbage collection
 	# is too slow.
@@ -1339,7 +1341,6 @@ if __name__ == "__main__":
 	scratch.nmat_work= CuBuffer(40*1000*1000*4,    name="nmat_work")
 	# Disable the cufft cache. It uses too much gpu memory
 	cupy.fft.config.get_plan_cache().set_memsize(0)
-	L      = Logger(id=comm.rank, level=args.verbose-args.quiet)
 	L.print("Mapping %d tods with %d mpi tasks" % (nfile, comm.size), level=0, id=0, color=colors.lgreen)
 	prefix = args.odir + "/"
 	if args.prefix: prefix += args.prefix + "_"
