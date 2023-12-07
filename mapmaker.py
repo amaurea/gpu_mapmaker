@@ -16,8 +16,9 @@ from pixell import enmap, utils, mpi, bunch, fft, colors, memory
 import so3g, cupy
 from sotodlib import coords
 import pointing, gpu_mm
+mempool = cupy.get_default_memory_pool()
 
-def read_tod(fname):
+def read_tod(fname, mul=32):
 	"""Read a tod file in the simple npz format we use"""
 	res = bunch.Bunch()
 	# Could do this in a loop, but we do it explicitly so we
@@ -28,19 +29,26 @@ def read_tod(fname):
 		res.point_offset = f["point_offset"][:,::-1] # [ndet,{y,x}]
 		res.polangle     = f["polangle"]             # [ndet]
 		bore = f["boresight"]
-		res.ctime        = bore[0]                   # [nsamp]
-		res.boresight    = bore[[2,1]]               # [{el,az},nsamp]
-		res.tod          = f["tod"]                  # [ndet,nsamp]
-		res.cuts         = mask2cuts(f["cuts"])
+		n    = fft.fft_len(bore.shape[1]//mul, factors=[2,3,5,7])*mul
+		res.ctime        = bore[0,:n]                   # [nsamp]
+		res.boresight    = bore[[2,1],:n]               # [{el,az},nsamp]
+		res.tod          = f["tod"][:,:n]               # [ndet,nsamp]
+		res.cuts         = mask2cuts(f["cuts"][:,:n])
+	print("nsamp %d primes %s" % (res.tod.shape[1], utils.primes(res.tod.shape[1])))
 	return res
 
-def round_by(n, b): return (np.array(n)+b-1)//b*b
+def round_up  (n, b): return (np.array(n)+b-1)//b*b
+def round_down(n, b): return np.array(n)//b*b
 
 def mask2cuts(mask):
 	return so3g.proj.ranges.RangesMatrix.from_mask(mask)
 
+def cutime():
+	cupy.cuda.runtime.deviceSynchronize()
+	return time.time()
+
 class Logger:
-	def __init__(self, level=0, id=0, fmt="{id:3d} {t:6.2f} {mem:6.2f} {max:6.2f} {msg:s}"):
+	def __init__(self, level=0, id=0, fmt="{id:3d} {t:6.2f} {mem:6.2f} {gmem:6.2f} {msg:s}"):
 		self.level = level
 		self.id    = id
 		self.fmt   = fmt
@@ -48,7 +56,7 @@ class Logger:
 	def print(self, message, level=0, id=None, color=None, end="\n"):
 		if level > self.level: return
 		if id is not None and id != self.id: return
-		msg = self.fmt.format(id=self.id, t=(time.time()-self.t0)/60, mem=memory.current()/1024**3, max=memory.max()/1024**3, msg=message)
+		msg = self.fmt.format(id=self.id, t=(time.time()-self.t0)/60, mem=memory.current()/1024**3, max=memory.max()/1024**3, gmem=mempool.used_bytes()/1024**3, msg=message)
 		if color is not None:
 			msg = color + msg + colors.reset
 		print(msg, end=end)
@@ -151,10 +159,10 @@ class Nmat:
 	def apply(self, tod):
 		"""Multiply the time-ordered data tod[ndet,nsamp] by the inverse noise covariance matrix.
 		This is done in-pace, but the result is also returned."""
-		return tod*self.ivar
+		return tod.copy()
 	def white(self, tod):
 		"""Like apply, but without detector or time correlations"""
-		return tod*self.ivar
+		return tod.copy()
 	def write(self, fname):
 		bunch.write(fname, bunch.Bunch(type="Nmat"))
 	@staticmethod
@@ -345,7 +353,8 @@ class NmatDetvecs(Nmat):
 
 class NmatDetvecsGpu(Nmat):
 	def __init__(self, bin_edges=None, eig_lim=16, single_lim=0.55, mode_bins=[0.25,4.0,20],
-			downweight=[], window=2, nwin=None, verbose=False, bins=None, D=None, V=None, E=None, ivar=None):
+			downweight=[], window=2, nwin=None, verbose=False, bins=None, D=None, V=None, E=None, ivar=None,
+			nstream=100):
 		# Variables used for building the noise model
 		if bin_edges is None: bin_edges = np.array([
 			0.16, 0.25, 0.35, 0.45, 0.55, 0.70, 0.85, 1.00,
@@ -371,16 +380,19 @@ class NmatDetvecsGpu(Nmat):
 		self.ready      = all([a is not None for a in [D, V, E, ivar]])
 		if self.ready:
 			self.D, self.V, self.E, self.ivar = [cupy.asarray(a) for a in [D, V, E, ivar]]
+			self.streams = [cupy.cuda.Stream(non_blocking=True) for i in range(nstream)]
 	def build(self, tod, srate, extra=False, **kwargs):
 		# Apply window before measuring noise model
+		dtype = tod.dtype
 		nwin  = utils.nint(self.window*srate)
+		ndet, nsamp = tod.shape
+		nfreq = nsamp//2+1
 		tod   = cupy.asarray(tod)
 		apply_window(tod, nwin)
 		ft    = cupy.fft.rfft(tod)
 		# Unapply window again
 		apply_window(tod, nwin, -1)
-		ndet, nfreq = ft.shape
-		nsamp = tod.shape[1]
+		del tod
 		# First build our set of eigenvectors in two bins. The first goes from
 		# 0.25 to 4 Hz the second from 4Hz and up
 		mode_bins = makebins(self.mode_bins, srate, nfreq, 1000, rfun=np.round)[1:]
@@ -396,75 +408,56 @@ class NmatDetvecsGpu(Nmat):
 		nbin      = len(bins)
 		# Now measure the power of each basis vector in each bin. The residual
 		# noise will be modeled as uncorrelated
-		E  = cupy.zeros([nbin,nmode])
-		D  = cupy.zeros([nbin,ndet])
-		Nd = cupy.zeros([nbin,ndet])
+		E  = cupy.zeros([nbin,nmode],dtype)
+		D  = cupy.zeros([nbin,ndet],dtype)
+		Nd = cupy.zeros([nbin,ndet],dtype)
 		for bi, b in enumerate(bins):
 			# Skip the DC mode, since it's it's unmeasurable and filtered away
 			b = np.maximum(1,b)
 			E[bi], D[bi], Nd[bi] = measure_detvecs(ft[:,b[0]:b[1]], V)
+		del Nd, ft
 		# Optionally downweight the lowest frequency bins
 		if self.downweight != None and len(self.downweight) > 0:
 			D[:len(self.downweight)] /= cupy.array(self.downweight)[:,None]
 		# Also compute a representative white noise level
-		bsize = bins[:,1]-bins[:,0]
-		ivar  = np.sum(1/D.get()*bsize[:,None],0)/np.sum(bsize)
-		ivar *= tod.shape[1]
+		bsize = cupy.array(bins[:,1]-bins[:,0])
+		ivar  = cupy.sum(1/D*bsize[:,None],0)/cupy.sum(bsize)
+		ivar *= nsamp
 		nmat  = NmatDetvecsGpu(bin_edges=self.bin_edges, eig_lim=self.eig_lim, single_lim=self.single_lim,
 				window=self.window, nwin=nwin, downweight=self.downweight, verbose=self.verbose,
 				bins=bins, D=D, V=V, E=E, ivar=ivar)
 		return nmat
-	def apply(self, tod, inplace=True):
-		ap  = anypy(self.D)
-		t1 = time.time()
-		gtod= ap.array(tod)
-		cupy.cuda.runtime.deviceSynchronize()
-		t2 = time.time()
+	def apply(self, gtod, inplace=True):
+		t1 = cutime()
+		if not inplace: god = gtod.copy()
 		apply_window(gtod, self.nwin)
-		cupy.cuda.runtime.deviceSynchronize()
-		t3 = time.time()
-		ft = ap.fft.rfft(gtod, axis=1)
-		cupy.cuda.runtime.deviceSynchronize()
-		t4 = time.time()
+		t2 = cutime()
+		ft = cupy.fft.rfft(gtod, axis=1)
 		# If we don't cast to real here, we get the same result but much slower
 		rft = ft.view(gtod.dtype)
+		t3 = cutime()
 		for i, (b1,b2) in enumerate(self.bins*2):
 			# N  = D + VEV'
 			# N" = D" - D"V(E"+V'DV)"V'D"
-			iA   = 1/self.D[i,:]
-			core = ap.linalg.inv(ap.diag(1/self.E[i]) + self.V.T @ (iA[:,None]*self.V))
-			iAd  = iA[:,None]*rft[:,b1:b2]
-			rft[:,b1:b2] = iAd - iA[:,None] * (self.V @ core @ self.V.T @ iAd)
+			with self.streams[i%len(self.streams)] as s:
+				iA   = 1/self.D[i,:]
+				core = cupy.linalg.inv(cupy.diag(1/self.E[i]) + self.V.T @ (iA[:,None]*self.V))
+				iAd  = iA[:,None]*rft[:,b1:b2]
+				rft[:,b1:b2] = iAd - iA[:,None] * ((self.V @ core) @ (self.V.T @ iAd))
 		cupy.cuda.runtime.deviceSynchronize()
-		t5 = time.time()
-		gtod[:]=ap.fft.irfft(ft,axis=1,n=tod.shape[1],norm="forward")
-		cupy.cuda.runtime.deviceSynchronize()
-		t6 = time.time()
+		t4 = cutime()
+		gtod[:]=cupy.fft.irfft(ft,axis=1,n=gtod.shape[1],norm="forward")
+		t5 = cutime()
 		apply_window(gtod, self.nwin)
-		cupy.cuda.runtime.deviceSynchronize()
-		t7 = time.time()
-		if isinstance(tod, np.ndarray):
-			if inplace: tod[:] = gtod.get()
-			else: tod = gtod.get()
-		else:
-			if inplace:
-				tod[:] = gtod
-		cupy.cuda.runtime.deviceSynchronize()
-		t8 = time.time()
-		L.print("iN sub tf %6.4f win %6.4f fft %6.4f mats %6.4f ifft %6.4f win %6.4f tf %6.4f" % (t2-t1,t3-t2,t4-t3,t5-t4,t6-t5,t7-t6,t8-t7), level=3)
-		return tod
-	def white(self, tod, inplace=True):
-		ap   = anypy(self.D)
-		gtod = ap.array(tod)
+		t6 = cutime()
+		L.print("iN sub win %6.4f fft %6.4f mats %6.4f ifft %6.4f win %6.4f" % (t2-t1,t3-t2,t4-t3,t5-t4,t6-t5), level=3)
+		return gtod
+	def white(self, gtod, inplace=True):
+		if not inplace: gtod.copy()
 		apply_window(gtod, self.nwin)
 		gtod *= self.ivar[:,None]
 		apply_window(gtod, self.nwin)
-		if isinstance(tod, np.ndarray):
-			if inplace: tod[:] = gtod.get()
-			else: tod = gtod.get()
-		else:
-			if inplace: tod[:] = gtod
-		return tod
+		return gtod
 	def write(self, fname):
 		data = bunch.Bunch(type="NmatDetvecsGpu")
 		for field in ["bin_edges", "eig_lim", "single_lim", "window", "nwin", "downweight",
@@ -542,6 +535,7 @@ def find_modes_jon(ft, bins, eig_lim=None, single_lim=0, skip_mean=False, verbos
 		cov  = measure_cov(d)
 		cov  = project_out_from_matrix(cov, vecs)
 		e, v = ap.linalg.eigh(cov)
+		del cov
 		#e, v = e.real, v.real
 		#e, v = e[::-1], v[:,::-1]
 		accept = ap.full(len(e), True, bool)
@@ -655,6 +649,8 @@ class Signal:
 	def prepare(self): self.ready = True
 	def forward (self, id, tod, x): pass
 	def backward(self, id, tod, x): pass
+	def precalc_setup(self, id): pass
+	def precalc_free (self, id): pass
 	def precon(self, x): return x
 	def to_work  (self, x): return x.copy()
 	def from_work(self, x): return x
@@ -794,7 +790,7 @@ class SignalMapGpu(Signal):
 		self.comps = "TQU"
 		self.ncomp = 3
 		self.ishape= tuple(shape[-2:])
-		shape      = tuple(round_by(shape[-2:], 64))
+		shape      = tuple(round_up(shape[-2:], 64))
 		self.rhs = enmap.zeros((self.ncomp,)+shape, wcs, dtype=dtype)
 		self.div = enmap.zeros(              shape, wcs, dtype=dtype)
 		self.hits= enmap.zeros(              shape, wcs, dtype=dtype)
@@ -874,6 +870,8 @@ class SignalMapGpu(Signal):
 		if tmul != 1: gtod  = gtod*tmul
 		if mmul != 1: gmap *= mmul
 		self.data[id].pmap.backward(gtod, gmap)
+	def precalc_setup(self, id): self.data[id].pmap.precalc_setup()
+	def precalc_free (self, id): self.data[id].pmap.precalc_free()
 	def precon(self, map):
 		return self.idiv * map
 	def to_work(self, map):
@@ -1060,12 +1058,10 @@ class MLMapmaker:
 			except Exception as e:
 				msg = f"FAILED to build a noise model for observation='{id}' : '{e}'"
 				raise RuntimeError(msg)
-		print("F", so3g.useful_info()["omp_num_threads"])
 		t4 = time.time()
 		# And apply it to the tod
 		gtod = nmat.apply(gtod)
 		t5 = time.time()
-		print("G", so3g.useful_info()["omp_num_threads"])
 		# Add the observation to each of our signals
 		for signal in self.signals:
 			signal.add_obs(id, obs, nmat, gtod)
@@ -1091,28 +1087,30 @@ class MLMapmaker:
 		t2 = time.time()
 		for di, data in enumerate(self.data):
 			# This is the main place that needs to change for the GPU implementation
-			ta1 = time.time()
+			ta1 = cutime()
 			gtod= ap.zeros([data.ndet, data.nsamp], self.dtype)
-			ta2 = time.time()
+			ta2 = cutime()
 			for si, signal in reversed(list(enumerate(self.signals))):
+				signal.precalc_setup(data.id)
 				signal.forward(data.id, gtod, iwork[si])
-			ta3 = time.time()
+			ta3 = cutime()
 			data.nmat.apply(gtod)
-			ta4 = time.time()
+			ta4 = cutime()
 			for si, signal in enumerate(self.signals):
 				signal.backward(data.id, gtod, owork[si])
-			ta5 = time.time()
+				signal.precalc_free(data.id)
+			ta5 = cutime()
 			L.print("A z %6.3f P %6.3f N %6.3f P' %6.3f %s" % (ta2-ta1, ta3-ta2, ta4-ta3, ta5-ta4, data.id), level=2)
-		t3 = time.time()
+		t3 = cutime()
 		result = self.dof.zip(*[signal.from_work(w) for signal,w in zip(self.signals,owork)])
-		t4 = time.time()
+		t4 = cutime()
 		L.print("A prep %6.3f PNP %6.3f finish %6.3f" % (t2-t1, t3-t2, t4-t3), level=2)
 		return result
 	def M(self, x):
-		t1 = time.time()
+		t1 = cutime()
 		iwork = self.dof.unzip(x)
 		result = self.dof.zip(*[signal.precon(w) for signal, w in zip(self.signals, iwork)])
-		t2 = time.time()
+		t2 = cutime()
 		L.print("M %6.3f" % (t2-t1), level=2)
 		return result
 	def solve(self, maxiter=500, maxerr=1e-6):
@@ -1126,10 +1124,112 @@ class MLMapmaker:
 			t2 = time.time()
 			yield bunch.Bunch(i=solver.i, err=solver.err, x=x, t=t2-t1)
 
+def calc_pointing(ctime, bore, offs, polang, site="so", weather="typical", dtype=np.float32):
+	offs, polang = np.asarray(offs), np.asarray(polang)
+	ndet, nsamp = len(offs), bore.shape[1]
+	sightline = so3g.proj.coords.CelestialSightLine.az_el(ctime, bore[1], bore[0], site="so", weather="typical")
+	q_det     = so3g.proj.quat.rotation_xieta(offs[:,1], offs[:,0], np.pi/2-polang)
+	pos_equ   = np.moveaxis(sightline.coords(q_det),2,0) # [{ra,dec,c1,s1},ndet,nsamp]
+	pos_equ[:2] = pos_equ[1::-1] # [{dec,ra,c1,s1},ndet,nsamp]
+	return pos_equ
+
+class PointingFit:
+	def __init__(self, shape, wcs, ctime, bore, offs, polang,
+			subsamp=200, site="so", weather="typical", dtype=np.float64,
+			nt=1, nx=3, ny=3, store_basis=False):
+		"""Jon's polynomial pointing fit. This predicts each detectors celestial
+		coordinates based on the array center's celestial coordinates. The model
+		fit is
+		 pos_det = B a + n
+		where
+		 B = [1,t**{1},ra**{1,2,3,4},dec**{1,2,3},t*ra,t*dec,ra*dec]
+		The ML fit for this is
+		 a = (B'B)"B'pos_det
+		Actually, going all the way to pixels will be just as cheap as going to
+		ra, dec. What's the best way to handle this?
+		1. Build everything into this class
+		2. Make the interpolator more general, so it takes a function that provides
+		pointing as an argument.
+		For now I'll stick with the simple #1"""
+		self.shape, self.wcs = shape, wcs
+		self.nt, self.nx, self.ny = nt, nx, ny
+		self.dtype = dtype
+		self.store_basis = store_basis
+		self.subsamp     = subsamp
+		self.nphi = utils.nint(360/np.abs(wcs.wcs.cdelt[1]))
+		# 1. Find the typical detector offset
+		off0 = np.mean(offs, 0)
+		# 2. We want to be able to calculate y,x,psi for any detector offset
+		p0 = enmap.pix2sky(shape, wcs, [0,0]) # [{dec,ra}]
+		dp = wcs.wcs.cdelt[::-1]*utils.degree # [{dec,ra}]
+		nphi = utils.nint(360/np.abs(wcs.wcs.cdelt[0]))
+		def calc_pixs(ctime, bore, offs, polang):
+			offs, polang = np.asarray(offs), np.asarray(polang)
+			ndet, nsamp  = len(offs), bore.shape[1]
+			pixs      = np.empty((3,ndet,nsamp),dtype) # [{y,x,psi},ndet,nsamp]
+			pos_equ   = calc_pointing(ctime, bore, offs, polang, site=site, weather=weather, dtype=dtype)
+			# Unwind avoids angle wraps, which are bad for interpolation
+			pos_equ[0]= utils.unwind(pos_equ[0])
+			pixs[:2]  = (pos_equ[:2]-p0[:,None,None])/dp[:,None,None]
+			pixs[2]   = utils.unwind(np.arctan2(pos_equ[3],pos_equ[2]))
+			return pixs
+		# 3. Calculate the full pointing for the reference pixel
+		ref_pixs = cupy.array(calc_pixs(ctime, bore, off0[None], [0])[:,0])
+		# 4. Calculate a sparse pointing for the individual detectors
+		det_pixs = cupy.array(calc_pixs(ctime[::subsamp], bore[:,::subsamp], offs, polang))
+		# 5. Calculate the basis
+		B        = self.basis(ref_pixs)
+		# Store either the basis or the reference pointing
+		if store_basis: self.B = B
+		else:           self.ref_pixs = ref_pixs
+		# 6. Calculate and store the interpolation coefficients coefficients
+		self.coeffs = self.fit(det_pixs, B[:,::subsamp])
+	def basis(self, ref_pixs):
+		"""Calculate the interpolation basis"""
+		nsamp = ref_pixs.shape[-1]
+		B     = cupy.empty((1+self.nt+self.nx+self.ny+3,nsamp),self.dtype)
+		mins  = cupy.min(ref_pixs[:2],1)
+		maxs  = cupy.max(ref_pixs[:2],1)
+		t     = cupy.linspace(-1,1,nsamp,self.dtype)
+		y, x  = ref_pixs[:2]
+		B[0]  = 1
+		# I wish python had a better way to write this
+		for i in range(self.nt): B[1+i]                 = t**(i+1)
+		for i in range(self.nx): B[1+self.nt+i]         = x**(i+1)
+		for i in range(self.ny): B[1+self.nt+self.nx+i] = y**(i+1)
+		B[1+self.nt+self.nx+self.ny+0] = t*x
+		B[1+self.nt+self.nx+self.ny+1] = t*y
+		B[1+self.nt+self.nx+self.ny+2] = x*y
+		return B
+	def fit(self, det_pixs, B=None):
+		"""Fit the interpolation coefficients given det_pixs[{y,x,psi},ndet,nsamp]"""
+		if B is None: B = self.basis(self.ref_pixs) # [ndof,nsamp]
+		# The fit needs to be done in double precision. The rest is fine in single precision
+		B64 = B.astype(np.float64)
+		v64 = det_pixs.astype(np.float64)
+		idiv= cupy.linalg.inv(B64.dot(B64.T))
+		coeffs = v64.dot(B64.T).dot(idiv)
+		coeffs = coeffs.astype(self.dtype)
+		return coeffs
+	def eval(self, coeffs=None, B=None):
+		if B is None:
+			B = self.B if self.store_basis else self.basis(self.ref_pixs)
+		if coeffs is None:
+			coeffs = self.coeffs
+		return self.wrap(coeffs.dot(B))
+	def wrap(self, pixs):
+		# FIXME: handle samples that go off the edge of the map
+		# here if it hasn't been implemented in the pointing matrix yet
+		#print(utils.minmax(pixs.get(),(-2,-1)))
+		#print(self.shape)
+		pixs[0] = cupy.clip(pixs[0], 1, self.shape[-2]-2)
+		pixs[1] = cupy.clip(pixs[1], 1, self.shape[-1]-2)
+		return pixs
+
+
 class PmatMapGpu:
 	def __init__(self, shape, wcs, ctime, bore, offs, polang, ncomp=3, dtype=np.float32):
 		self.shape = shape
-		print(shape)
 		self.wcs   = wcs
 		self.ctime = ctime
 		self.bore  = bore
@@ -1137,58 +1237,44 @@ class PmatMapGpu:
 		self.polang= polang
 		self.dtype = dtype
 		self.ncomp = ncomp
-		# Will expand pointing on the fly later, but for now precompute here
-		pos  = cupy.array(pointing.calc_pointing(ctime, bore, offs, polang, dtype=dtype)) # [{dec,ra,c,s}]
-		#np.save("test2.npy", pos[:,0].get())
-		#np.save("test3.npy", bore)
-		# Kendrick's pointing expects [{y,x,psi},ndet,nsamp]
-		p0 = cupy.array(enmap.pix2sky(shape, wcs, [0,0]))
-		dp = cupy.array(wcs.wcs.cdelt[::-1]*utils.degree)
-		pos[:2] -= p0[:,None,None]
-		pos[:2] /= dp[:,None,None]
-		pos[2]   = cupy.arctan2(pos[3],pos[2])/2
-		self.pointing = pos[:3]
-		#np.save("test.npy", self.pointing[:,0].get())
-		#1/0
+		self.pfit  = PointingFit(shape, wcs, ctime, bore, offs, polang, dtype=dtype)
 		# Precompute a pointing plan. This is slow, and uses quite a bit of
 		# memory, but will be changed later
-		self.plan = gpu_mm.PointingPlan(self.pointing.get(), self.shape[-2], self.shape[-1])
+		self.plan = gpu_mm.PointingPlan(self.pfit.eval().get(), self.shape[-2], self.shape[-1])
+		self.pointing = None
 	def forward(self, gtod, gmap):
 		# For now transfer the tod and map each time. Later these will stay on the
 		# gpu as long as possible
-		t1 = time.time()
-		cupy.cuda.runtime.deviceSynchronize()
-		t2 = time.time()
-		gpu_mm.gpu_map2tod(gtod, gmap, self.pointing)
-		cupy.cuda.runtime.deviceSynchronize()
-		t3 = time.time()
-		cupy.cuda.runtime.deviceSynchronize()
-		t4 = time.time()
-		L.print("Pcore tf %6.4f gpu %6.4f tf %6.4f" % (t2-t1,t3-t2,t4-t3), level=3)
+		t1 = cutime()
+		pointing = self.pointing if self.pointing is not None else self.pfit.eval()
+		t2 = cutime()
+		gpu_mm.gpu_map2tod(gtod, gmap, pointing)
+		t3 = cutime()
+		L.print("Pcore pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
 		return gtod
 	def backward(self, gtod, gmap=None):
 		if gmap is None:
 			gmap = cupy.zeros((self.ncomp,)+self.shape[-2:], self.dtype)
-		t1 = time.time()
-		cupy.cuda.runtime.deviceSynchronize()
-		t2 = time.time()
-		gpu_mm.gpu_tod2map(gmap, gtod, self.pointing, self.plan)
-		cupy.cuda.runtime.deviceSynchronize()
-		t3 = time.time()
-		cupy.cuda.runtime.deviceSynchronize()
-		t4 = time.time()
-		L.print("P'core tf %6.4f gpu %6.4f tf %6.4f" % (t2-t1,t3-t2,t4-t3), level=3)
+		t1 = cutime()
+		pointing = self.pointing if self.pointing is not None else self.pfit.eval()
+		t2 = cutime()
+		gpu_mm.gpu_tod2map(gmap, gtod, pointing, self.plan)
+		t3 = cutime()
+		L.print("P'core pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
 		return gmap
+	def precalc_setup(self): self.pointing = self.pfit.eval()
+	def precalc_free (self): self.pointing = None
 
 if __name__ == "__main__":
 	print("A", so3g.useful_info()["omp_num_threads"])
-
 	ifiles = sum([sorted(utils.glob(ifile)) for ifile in args.ifiles],[])
 	nfile  = len(ifiles)
 	comm   = mpi.COMM_WORLD
 	dtype_tod = np.float32
 	dtype_map = np.float32
 	shape, wcs = enmap.read_map_geometry(args.area)
+	# Disable the cufft cache. It uses too much gpu memory
+	cupy.fft.config.get_plan_cache().set_memsize(int(1e9))
 	L      = Logger(id=comm.rank, level=args.verbose-args.quiet)
 	L.print("Mapping %d tods with %d mpi tasks" % (nfile, comm.size), level=0, id=0, color=colors.lgreen)
 	prefix = args.odir + "/"
@@ -1211,6 +1297,7 @@ if __name__ == "__main__":
 		t2    = time.time()
 		print("D", so3g.useful_info()["omp_num_threads"])
 		mapmaker.add_obs(id, data, deslope=False)
+		del data
 		t3    = time.time()
 		L.print("Processed %s in %6.3f. Read %6.3f Add %6.3f" % (id, t3-t1, t2-t1, t3-t2))
 	# Solve the equation system
