@@ -16,8 +16,38 @@ from pixell import enmap, utils, mpi, bunch, fft, colors, memory
 import so3g, cupy
 from sotodlib import coords
 import pointing, gpu_mm
+import nvidia_smi
+nvidia_smi.nvmlInit()
 mempool = cupy.get_default_memory_pool()
 scratch = bunch.Bunch()
+plan_cache = gpu_mm.cufft.PlanCache()
+
+
+def get_gpu_memuse():
+	handle = nvidia_smi.nvmlDeviceGetHandleByIndex(0)
+	info   = nvidia_smi.nvmlDeviceGetMemoryInfo(handle)
+	return info.used
+
+@contextlib.contextmanager
+def leakcheck(name):
+	try:
+		mem1 = get_gpu_memuse()
+		yield
+	finally:
+		mem2 = get_gpu_memuse()
+		print("%s %8.5f GB" % (name, (mem2-mem1)/1e9))
+
+def get_filelist(ifiles):
+	fnames = []
+	for gfile in ifiles:
+		for ifile in sorted(utils.glob(gfile)):
+			if ifile.startswith("@"):
+				with open(ifile[1:],"r") as f:
+					for line in f:
+						fnames.append(line.strip())
+			else:
+				fnames.append(ifile)
+	return fnames
 
 def read_tod(fname, mul=32):
 	"""Read a tod file in the simple npz format we use"""
@@ -35,7 +65,9 @@ def read_tod(fname, mul=32):
 		res.boresight    = bore[[2,1],:n]               # [{el,az},nsamp]
 		res.tod          = f["tod"][:,:n]               # [ndet,nsamp]
 		res.cuts         = mask2cuts(f["cuts"][:,:n])
-	print("nsamp %d primes %s" % (res.tod.shape[1], utils.primes(res.tod.shape[1])))
+	for key in res:
+		res[key] = np.ascontiguousarray(res[key])
+	print("ndet %d nsamp %d primes %s" % (res.tod.shape[0], res.tod.shape[1], utils.primes(res.tod.shape[1])))
 	return res
 
 def round_up  (n, b): return (n+b-1)//b*b
@@ -88,7 +120,7 @@ class CuBuffer:
 			self.offset = offset
 
 class Logger:
-	def __init__(self, level=0, id=0, fmt="{id:3d} {t:6.2f} {mem:6.2f} {gmem:6.2f} {msg:s}"):
+	def __init__(self, level=0, id=0, fmt="{id:3d} {t:6.2f} {mem:6.2f} {gmem:6.2f} {gmem2:6.2f} {msg:s}"):
 		self.level = level
 		self.id    = id
 		self.fmt   = fmt
@@ -96,7 +128,8 @@ class Logger:
 	def print(self, message, level=0, id=None, color=None, end="\n"):
 		if level > self.level: return
 		if id is not None and id != self.id: return
-		msg = self.fmt.format(id=self.id, t=(time.time()-self.t0)/60, mem=memory.current()/1024**3, max=memory.max()/1024**3, gmem=mempool.used_bytes()/1024**3, msg=message)
+		gmem2 = get_gpu_memuse() - mempool.used_bytes()
+		msg = self.fmt.format(id=self.id, t=(time.time()-self.t0)/60, mem=memory.current()/1024**3, max=memory.max()/1024**3, gmem=mempool.used_bytes()/1024**3, gmem2=gmem2/1024**3, msg=message)
 		if color is not None:
 			msg = color + msg + colors.reset
 		print(msg, end=end)
@@ -429,7 +462,8 @@ class NmatDetvecsGpu(Nmat):
 		nfreq = nsamp//2+1
 		tod   = cupy.asarray(tod)
 		apply_window(tod, nwin)
-		ft    = cupy.fft.rfft(tod)
+		#ft   = cupy.fft.rfft(tod)
+		ft    = gpu_mm.cufft.rfft(tod, plan_cache=plan_cache)
 		# Unapply window again
 		apply_window(tod, nwin, -1)
 		del tod
@@ -472,8 +506,10 @@ class NmatDetvecsGpu(Nmat):
 		if not inplace: god = gtod.copy()
 		apply_window(gtod, self.nwin)
 		t2 = cutime()
-		with scratch.ft.as_allocator():
-			ft = cupy.fft.rfft(gtod, axis=1)
+		#with scratch.ft.as_allocator():
+		#	ft = cupy.fft.rfft(gtod, axis=1)
+		ft = scratch.ft.view((gtod.shape[0],gtod.shape[1]//2+1),utils.complex_dtype(gtod.dtype))
+		gpu_mm.cufft.rfft(gtod, ft, plan_cache=plan_cache)
 		# If we don't cast to real here, we get the same result but much slower
 		rft = ft.view(gtod.dtype)
 		t3 = cutime()
@@ -498,12 +534,11 @@ class NmatDetvecsGpu(Nmat):
 					rft[:,b1:b2] -= iAd
 		cupy.cuda.runtime.deviceSynchronize()
 		t4 = cutime()
-		with scratch.tod2.as_allocator():
-			gtod[:]=cupy.fft.irfft(ft,axis=1,n=gtod.shape[1],norm="forward")
+		gpu_mm.cufft.irfft(ft, gtod, plan_cache=plan_cache)
 		t5 = cutime()
 		apply_window(gtod, self.nwin)
 		t6 = cutime()
-		L.print("iN sub win %6.4f fft %6.4f mats %6.4f ifft %6.4f win %6.4f" % (t2-t1,t3-t2,t4-t3,t5-t4,t6-t5), level=3)
+		L.print("iN sub win %6.4f fft %6.4f mats %6.4f ifft %6.4f win %6.4f ndet %3d nsamp %5d nmode %2d nbin %2d" % (t2-t1,t3-t2,t4-t3,t5-t4,t6-t5, gtod.shape[0], gtod.shape[1], self.V.shape[1], len(self.bins)), level=3)
 		return gtod
 	def white(self, gtod, inplace=True):
 		if not inplace: gtod.copy()
@@ -597,13 +632,13 @@ def find_modes_jon(ft, bins, eig_lim=None, single_lim=0, skip_mean=False, verbos
 			nsamp    = b[1]-b[0]+1
 			median_e = ap.median(ap.sort(e)[::-1][:nsamp])
 			accept  &= e/median_e >= eig_lim[bi]
-		if verbose: print("bin %d: %4d modes above eig_lim" % (bi, ap.sum(accept)))
+		if verbose: print("bin %d %5d %5d: %4d modes above eig_lim" % (bi, b[0], b[1], ap.sum(accept)))
 		if single_lim is not None and e.size:
 			# Reject modes too concentrated into a single mode. Since v is normalized,
 			# values close to 1 in a single component must mean that all other components are small
 			singleness = ap.max(ap.abs(v),0)
 			accept    &= singleness < single_lim[bi]
-		if verbose: print("bin %d: %4d modes also above single_lim" % (bi, ap.sum(accept)))
+		if verbose: print("bin %d %5d %5d: %4d modes also above single_lim" % (bi, b[0], b[1], ap.sum(accept)))
 		e, v = e[accept], v[:,accept]
 		vecs = ap.concatenate([vecs,v],1)
 	return vecs
@@ -853,16 +888,18 @@ class SignalMapGpu(Signal):
 		nmat a noise model, representing the inverse noise covariance matrix,
 		and Nd the result of applying the noise model to the detector time-ordered data.
 		"""
-		Nd     = Nd.copy() # This copy can be avoided if build_obs is split into two parts
+		#Nd     = Nd.copy() # This copy can be avoided if build_obs is split into two parts
 		ctime  = obs.ctime
 		t1     = time.time()
 		pcut   = PmatCutGpu(obs.cuts) # could pass this in, but fast to construct
 		if pmap is None:
 			pmap = PmatMapGpu(self.rhs.shape, self.rhs.wcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, dtype=Nd.dtype)
+			gpu_garbage_collect()
 		# Build the RHS for this observation
 		t2 = time.time()
 		pcut.clear(Nd)
 		obs_rhs = pmap.backward(Nd)
+		gpu_garbage_collect()
 		t3 = time.time()
 		# Build the per-pixel inverse variance for this observation.
 		# This will be scalar to make the preconditioner fast, but uses
@@ -874,12 +911,14 @@ class SignalMapGpu(Signal):
 		pcut.clear(Nd)
 		Nd = nmat.white(Nd)
 		obs_div = pmap.backward(Nd)[0]
+		gpu_garbage_collect()
 		t4 = time.time()
 		# Build hitcount
 		Nd[:]        = 0
 		pmap.forward(Nd, ones)
 		pcut.clear(Nd)
 		obs_hits = pmap.backward(Nd)[0]
+		gpu_garbage_collect()
 		t5 = time.time()
 		del Nd, ones
 		# Update our full rhs and div. This works for both plain and distributed maps
@@ -889,6 +928,7 @@ class SignalMapGpu(Signal):
 		self.rhs = self.rhs .insert(obs_rhs , op=np.ndarray.__iadd__)
 		self.div = self.div .insert(obs_div , op=np.ndarray.__iadd__)
 		self.hits= self.hits.insert(obs_hits, op=np.ndarray.__iadd__)
+		gpu_garbage_collect()
 		t6 = time.time()
 		L.print("Init map pmat %6.3f rhs %6.3f div %6.3f hit %6.3f add %6.3f %s" % (t2-t1,t3-t2,t4-t3,t5-t4,t6-t5,id), level=2)
 		# Save the per-obs things we need. Just the pointing matrix in our case.
@@ -1096,7 +1136,7 @@ class MLMapmaker:
 		if deslope:
 			utils.deslope(tod, w=5, inplace=True)
 		t3 = time.time()
-		gtod = ap.array(tod)
+		gtod = scratch.tod.copy(tod)
 		del tod
 		# Allow the user to override the noise model on a per-obs level
 		if noise_model is None: noise_model = self.noise_model
@@ -1278,8 +1318,10 @@ class PointingFit:
 		return pointing
 	def wrap(self, pixs):
 		# FIXME: Remove this when mapmaker handles this itself
-		cupy.clip(pixs[0], 1, self.shape[-2]-2, out=pixs[0])
-		cupy.clip(pixs[1], 1, self.shape[-1]-2, out=pixs[1])
+		#cupy.clip(pixs[0], 1, self.shape[-2]-2, out=pixs[0])
+		#cupy.clip(pixs[1], 1, self.shape[-1]-2, out=pixs[1])
+		gpu_mm.clip(pixs[0], 1, self.shape[-2]-2)
+		gpu_mm.clip(pixs[1], 1, self.shape[-1]-2)
 		return pixs
 
 class PmatMapGpu:
@@ -1320,9 +1362,29 @@ class PmatMapGpu:
 	def precalc_setup(self): self.pointing = self.pfit.eval()
 	def precalc_free (self): self.pointing = None
 
+def fft_test():
+	ndet  = 1000
+	nsamp = 250000
+	scratch.tod = CuBuffer(ndet*nsamp*4,        name="tod")
+	scratch.ft  = CuBuffer(ndet*(nsamp//2+1)*8, name="ft")
+	i = 0
+	for j in range(100):
+		for n in range(nsamp//2,nsamp):
+			factors = utils.primes(n)
+			if any(factors) > 7: continue
+			i += 1
+			#plan = gpu_mm.cufft.get_plan_r2c(ndet, n, alloc=False)
+			tod = scratch.tod.view((ndet,n),      np.float32)
+			ft  = scratch.ft .view((ndet,n//2+1), np.complex64)
+			gpu_mm.cufft.rfft (tod, ft, plan_cache=plan_cache)
+			gpu_mm.cufft.irfft(ft, tod, plan_cache=plan_cache)
+			if i > 200: break
+	input()
+	1/0
+
 if __name__ == "__main__":
-	print("A", so3g.useful_info()["omp_num_threads"])
-	ifiles = sum([sorted(utils.glob(ifile)) for ifile in args.ifiles],[])
+	#ifiles = sum([sorted(utils.glob(ifile)) for ifile in args.ifiles],[])
+	ifiles = get_filelist(args.ifiles)
 	nfile  = len(ifiles)
 	comm   = mpi.COMM_WORLD
 	dtype_tod = np.float32
@@ -1332,13 +1394,12 @@ if __name__ == "__main__":
 	L.print("Init", level=0, id=0, color=colors.lgreen)
 	# Set up our gpu scratch memory. These will be used for intermediate calculations.
 	# We do this instead of letting cupy allocate automatically because cupy garbage collection
-	# is too slow.
-	scratch.tod      = CuBuffer(1000*250000*4,     name="tod")
-	scratch.tod2     = CuBuffer(1000*250000*4*3,   name="tod2")
-	scratch.ft       = CuBuffer(1000*250000*4*2,   name="ft")
-	scratch.pointing = CuBuffer(3*1000*250000*4,   name="pointing")
-	scratch.map      = CuBuffer(3*shape[-2]*(shape[-1]+512)*4, name="map")
-	scratch.nmat_work= CuBuffer(40*1000*1000*4,    name="nmat_work")
+	# is too slow. We pre-allocate 6 GB of gpu ram. We also allocate some gpu ram in the plan_cache
+	scratch.tod      = CuBuffer(1000*250000*4,     name="tod")              # 1 GB
+	scratch.ft       = CuBuffer(1000*250000*4,     name="ft")               # 1 GB
+	scratch.pointing = CuBuffer(3*1000*250000*4,   name="pointing")         # 3 GB
+	scratch.map      = CuBuffer(3*shape[-2]*(shape[-1]+512)*4, name="map")  # 0.75 GB
+	scratch.nmat_work= CuBuffer(40*1000*1000*4,    name="nmat_work")        # 0.15 GB
 	# Disable the cufft cache. It uses too much gpu memory
 	cupy.fft.config.get_plan_cache().set_memsize(0)
 	L.print("Mapping %d tods with %d mpi tasks" % (nfile, comm.size), level=0, id=0, color=colors.lgreen)
@@ -1349,10 +1410,8 @@ if __name__ == "__main__":
 	#signal_map = SignalMap(shape, wcs, comm, dtype=dtype_map)
 	signal_map = SignalMapGpu(shape, wcs, comm, dtype=np.float32)
 	signal_cut = SignalCutGpu(comm)
-	print("B", so3g.useful_info()["omp_num_threads"])
 	# Set up the mapmaker
 	mapmaker = MLMapmaker(signals=[signal_cut,signal_map], dtype=dtype_tod, verbose=True, noise_model=NmatDetvecsGpu())
-	print("C", so3g.useful_info()["omp_num_threads"])
 	# Add our observations
 	for ind in range(comm.rank, nfile, comm.size):
 		ifile = ifiles[ind]
@@ -1360,8 +1419,9 @@ if __name__ == "__main__":
 		t1    = time.time()
 		data  = read_tod(ifile)
 		t2    = time.time()
-		print("D", so3g.useful_info()["omp_num_threads"])
-		mapmaker.add_obs(id, data, deslope=False)
+		with leakcheck("mapmaker.add_obs"):
+			mapmaker.add_obs(id, data, deslope=False)
+			gpu_garbage_collect()
 		del data
 		t3    = time.time()
 		L.print("Processed %s in %6.3f. Read %6.3f Add %6.3f" % (id, t3-t1, t2-t1, t3-t2))
