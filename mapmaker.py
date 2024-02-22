@@ -1527,7 +1527,11 @@ class PmatMapGpu:
 		t3 = cutime()
 		L.print("P'core pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
 		return gmap
-	def precalc_setup(self): self.pointing = self.pfit.eval()
+	def precalc_setup(self):
+		t1 = cutime()
+		self.pointing = self.pfit.eval()
+		t2 = cutime()
+		L.print("Pprep %6.4f" % (t2-t1), level=3)
 	def precalc_free (self): self.pointing = None
 
 def fft_test():
