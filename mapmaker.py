@@ -9,6 +9,7 @@ if __name__ == "__main__":
 	parser.add_argument("-p", "--prefix",  type=str, default=None)
 	parser.add_argument("-v", "--verbose", action="count", default=1)
 	parser.add_argument("-q", "--quiet",   action="count", default=0)
+	parser.add_argument("-n", "--maxfiles",type=int, default=0)
 	args = parser.parse_args()
 
 import numpy as np, os, time, contextlib
@@ -74,8 +75,34 @@ def read_tod(fname, mul=32):
 def round_up  (n, b): return (n+b-1)//b*b
 def round_down(n, b): return n//b*b
 
+#def mask2cuts(mask):
+#	return so3g.proj.ranges.RangesMatrix.from_mask(mask)
+
+# Cuts will be represented by det[nrange], start[nrange], len[nrange]. This is similar to
+# the format used in ACT, but in our test files we have boolean masks instead, which we need
+# convert. This is a bit slow, but is only needed for the test data
 def mask2cuts(mask):
-	return so3g.proj.ranges.RangesMatrix.from_mask(mask)
+	# Find where the mask turns on/off
+	t01 = time.time()
+	dets, starts, lens = [], [], []
+	for idet, dmask in enumerate(mask):
+		# index of all on/off and off/on transitions. We put it in a
+		# list so we can prepend and append to it
+		edges = [1+np.nonzero(np.diff(dmask,1))[0]]
+		# Ensure we start with off→on and end with on→off
+		if dmask[ 0]: edges.insert(0,[0])
+		if dmask[-1]: edges.append([mask.shape[1]])
+		edges = np.concatenate(edges) if len(edges) > 1 else edges[0]
+		start = edges[0::2].astype(np.int32)
+		stop  = edges[1::2].astype(np.int32)
+		dets  .append(np.full(len(start),idet,np.int32))
+		starts.append(start)
+		lens  .append(stop-start)
+	dets   = np.concatenate(dets)
+	starts = np.concatenate(starts)
+	lens   = np.concatenate(lens)
+	t02 = time.time()
+	return dets, starts, lens
 
 def cutime():
 	cupy.cuda.runtime.deviceSynchronize()
@@ -135,43 +162,73 @@ class Logger:
 			msg = color + msg + colors.reset
 		print(msg, end=end)
 
-class PmatCut:
-	"""Implementation of cuts-as-extra-degrees-of-freedom for a single obs."""
-	def __init__(self, cuts, model=None, params={"resolution":100, "nmax":100}):
-		self.cuts   = cuts
-		self.model  = model or "full"
-		self.params = params
-		self.njunk  = so3g.process_cuts(self.cuts.ranges, "measure", self.model, self.params, None, None)
-	def forward(self, tod, junk):
-		"""Project from the cut parameter (junk) space for this scan to tod."""
-		so3g.process_cuts(self.cuts.ranges, "insert", self.model, self.params, tod, junk)
-	def backward(self, tod, junk):
-		"""Project from tod to cut parameters (junk) for this scan."""
-		so3g.process_cuts(self.cuts.ranges, "extract", self.model, self.params, tod, junk)
-		self.clear(tod)
-	def clear(self, tod):
-		junk = np.empty(self.njunk, tod.dtype)
-		so3g.process_cuts(self.cuts.ranges, "clear", self.model, self.params, tod, junk)
+class PmatCutNull:
+	def __init__(self, cuts):
+		self.cuts  = cuts
+		self.ndof  = 1
+	def forward(self, tod, junk): pass
+	def backward(self, tod, junk): pass
+	def clear(self, tod): pass
 
-class PmatCutGpu:
-	"""Implementation of cuts-as-extra-degrees-of-freedom for a single obs."""
-	def __init__(self, cuts, model=None, params={"resolution":100, "nmax":100}):
-		self.cuts   = cuts
-		self.model  = model or "full"
-		self.params = params
-		# FIXME
-		self.njunk  = 1
+class PmatCutFullGpu:
+	def __init__(self, cuts):
+		dets, starts, lens = cuts
+		self.dets   = cupy.asarray(dets,   np.int32)
+		self.starts = cupy.asarray(starts, np.int32)
+		self.lens   = cupy.asarray(lens,   np.int32)
+		self.ndof   = np.sum(lens)  # number of values to solve for
+		self.nsamp  = self.ndof     # number of samples covered
+		self.offs   = cupy.asarray(cumsum0(lens), np.int32)
 	def forward(self, tod, junk):
-		"""Project from the cut parameter (junk) space for this scan to tod."""
-		# FIXME
-		pass
+		gpu_mm.insert_ranges(tod, junk, self.offs, self.dets, self.starts, self.lens)
 	def backward(self, tod, junk):
-		"""Project from tod to cut parameters (junk) for this scan."""
-		# FIXME
-		pass
+		gpu_mm.extract_ranges(tod, junk, self.offs, self.dets, self.starts, self.lens)
+		# Zero-out the samples we used, so the other signals (e.g. the map)
+		# don't need to care about them
 		self.clear(tod)
 	def clear(self, tod):
-		pass
+		gpu_mm.clear_ranges(tod, self.dets, self.starts, self.lens)
+
+class PmatCutPolyGpu:
+	def __init__(self, cuts, basis=None, order=None, bsize=None):
+		dets, starts, lens = cuts
+		# Either construct or use an existing basis
+		if basis is None:
+			if bsize is None: bsize = 400
+			if order is None: order = 4
+			self.basis = legbasis_gpu(order, bsize)
+		else:
+			assert order is None and bsize is None, "Specify either basis or order,bsize, not both"
+			order = basis.shape[0]-1
+			bsize = basis.shape[1]
+			self.basis = cupy.asarray(basis, dtype=np.float32)
+		# Subdivide ranges that are longer than our block size
+		dets, starts, lens = split_ranges(dets, starts, lens, bsize)
+		self.dets   = cupy.asarray(dets,   np.int32)
+		self.starts = cupy.asarray(starts, np.int32)
+		self.lens   = cupy.asarray(lens,   np.int32)
+		# total number of samples covered
+		self.nsamp  = np.sum(lens)
+		# output buffer information. Offsets
+		padlens     = (lens+bsize-1)//bsize*bsize
+		self.nrange = len(lens)
+		self.ndof   = self.nrange*(order+1)
+		self.offs   = cupy.asarray(cumsum0(padlens), np.int32)
+	def forward(self, tod, junk):
+		# B[nb,bsize], bjunk[nrange,nb], blocks[nrange,bsize] = bjunk.dot(B.T)
+		bjunk  = junk.reshape(self.nrange,self.basis.shape[0])
+		with scratch.cut.as_allocator():
+			blocks = bjunk.dot(self.basis)
+			gpu_mm.insert_ranges(tod, blocks, self.offs, self.dets, self.starts, self.lens)
+	def backward(self, tod, junk):
+		with scratch.cut.as_allocator():
+			blocks = cupy.zeros((self.nrange, self.basis.shape[1]), np.float32)
+			gpu_mm.extract_ranges(tod, blocks, self.offs, self.dets, self.starts, self.lens)
+			self.clear(tod)
+			bjunk   = blocks.dot(self.basis.T)
+			junk[:] = bjunk.reshape(-1)
+	def clear(self, tod):
+		gpu_mm.clear_ranges(tod, self.dets, self.starts, self.lens)
 
 class ArrayZipper:
 	def __init__(self, shape, dtype, comm=None):
@@ -881,6 +938,46 @@ def apply_window(tod, nsamp, exp=1):
 	tod[...,:nsamp]  *= taper
 	tod[...,-nsamp:] *= taper[::-1]
 
+
+def aranges(lens):
+	ntot = np.sum(lens)
+	itot = np.arange(ntot)
+	offs = np.repeat(np.cumsum(np.concatenate([[0],lens[:-1]])), lens)
+	return itot-offs
+
+def cumsum0(vals):
+	res = np.empty(len(vals), vals.dtype)
+	res[0] = 0
+	res[1:] = np.cumsum(vals[:-1])
+	return res
+
+def split_ranges(dets, starts, lens, maxlen):
+	# Vectorized splitting of detector ranges into subranges.
+	# Probably premature optimization, since it's a bit hard to read.
+	# Works by duplicating elements for too long ranges, and then
+	# calculating new sub-offsets inside these
+	dets, starts, lens = [np.asarray(a) for a in [dets,starts,lens]]
+	nsplit  = (lens+maxlen-1)//maxlen
+	odets   = np.repeat(dets, nsplit)
+	subi    = aranges(nsplit)
+	sublen  = np.repeat(lens, nsplit)
+	subns   = np.repeat(nsplit, nsplit)
+	offs    = subi*sublen//subns
+	ostarts = np.repeat(starts, nsplit)+offs
+	offs2   = (subi+1)*sublen//subns
+	oends   = offs2-offs
+	return odets, ostarts, oends
+
+def legbasis_gpu(order, n):
+	x   = cupy.linspace(-1, 1, n, dtype=np.float32)
+	out = cupy.empty((order+1, n),dtype=np.float32)
+	out[0] = 1
+	if order>0:
+		out[1] = x
+	for i in range(1,order):
+		out[i+1,:] = ((2*i+1)*x*out[i]-i*out[i-1])/(i+1)
+	return out
+
 # Signal classes represent the degrees of freedom we will solve for.
 # The Zippers should probably be merged with these
 
@@ -1059,7 +1156,11 @@ class SignalMapGpu(Signal):
 		#Nd     = Nd.copy() # This copy can be avoided if build_obs is split into two parts
 		ctime  = obs.ctime
 		t1     = time.time()
-		pcut   = PmatCutGpu(obs.cuts) # could pass this in, but fast to construct
+		# could pass this in, but fast to construct. Should ideally match what's used in
+		# signal_cut to be safest, but only uses .clear which should be the same for all
+		# of them anyway
+		pcut   = PmatCutFullGpu(obs.cuts)
+		#pcut   = PmatCutNull(obs.cuts)
 		if pmap is None:
 			pmap = PmatMapGpu(self.rhs.shape, self.rhs.wcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, dtype=Nd.dtype)
 			gpu_garbage_collect()
@@ -1212,13 +1313,14 @@ class SignalCut(Signal):
 class SignalCutGpu(Signal):
 	# Placeholder for when we have a gpu implementation
 	def __init__(self, comm, name="cut", ofmt="{name}_{rank:02}", dtype=np.float32,
-			output=False, cut_type=None):
+			output=False, type="poly", **pcut_kwargs):
 		"""Signal for handling the ML solution for the values of the cut samples."""
 		Signal.__init__(self, name, ofmt, output, ext="hdf")
 		self.comm  = comm
 		self.data  = {}
 		self.dtype = dtype
-		self.cut_type = cut_type
+		self.type = type
+		self.pcut_kwargs = pcut_kwargs
 		self.off   = 0
 		self.rhs   = []
 		self.div   = []
@@ -1227,20 +1329,24 @@ class SignalCutGpu(Signal):
 		nmat a noise model, representing the inverse noise covariance matrix,
 		and Nd the result of applying the noise model to the detector time-ordered data."""
 		Nd      = Nd.copy() # This copy can be avoided if build_obs is split into two parts
-		pcut    = PmatCutGpu(obs.cuts, model=self.cut_type)
+		pclass  = {"null":PmatCutNull, "full":PmatCutFullGpu, "poly":PmatCutPolyGpu}[self.type]
+		pcut    = pclass(obs.cuts, **self.pcut_kwargs)
 		# Build our RHS
-		obs_rhs = cupy.zeros(pcut.njunk, self.dtype)
+		obs_rhs = cupy.zeros(pcut.ndof, self.dtype)
 		pcut.backward(Nd, obs_rhs)
 		# Build our per-pixel inverse covmat
-		obs_div = cupy.ones(pcut.njunk, self.dtype)
+		obs_div = cupy.ones(pcut.ndof, self.dtype)
 		Nd[:]   = 0
 		pcut.forward(Nd, obs_div)
 		nmat.white(Nd)
 		pcut.backward(Nd, obs_div)
-		self.data[id] = bunch.Bunch(pcut=pcut, i1=self.off, i2=self.off+pcut.njunk)
-		self.off += pcut.njunk
+		# Needed for poly cut it seems
+		#obs_div[:] = cupy.mean(np.abs(obs_div))
+		self.data[id] = bunch.Bunch(pcut=pcut, i1=self.off, i2=self.off+pcut.ndof)
+		self.off += pcut.ndof
 		self.rhs.append(obs_rhs.get())
 		self.div.append(obs_div.get())
+		gpu_garbage_collect()
 	def prepare(self):
 		"""Process the added observations, determining our degrees of freedom etc.
 		Should be done before calling forward and backward."""
@@ -1557,6 +1663,7 @@ def fft_test():
 if __name__ == "__main__":
 	#ifiles = sum([sorted(utils.glob(ifile)) for ifile in args.ifiles],[])
 	ifiles = get_filelist(args.ifiles)
+	if args.maxfiles: ifiles = ifiles[:args.maxfiles]
 	nfile  = len(ifiles)
 	comm   = mpi.COMM_WORLD
 	dtype_tod = np.float32
@@ -1572,6 +1679,7 @@ if __name__ == "__main__":
 	scratch.pointing = CuBuffer(3*1000*250000*4,   name="pointing")         # 3 GB
 	scratch.map      = CuBuffer(3*shape[-2]*(shape[-1]+512)*4, name="map")  # 0.75 GB
 	scratch.nmat_work= CuBuffer(40*1000*1000*4,    name="nmat_work")        # 0.15 GB
+	scratch.cut      = CuBuffer(1000*750000*4,     name="cut")              # 0.3  GB (up to 30% cut)
 	# Disable the cufft cache. It uses too much gpu memory
 	cupy.fft.config.get_plan_cache().set_memsize(0)
 	L.print("Mapping %d tods with %d mpi tasks" % (nfile, comm.size), level=0, id=0, color=colors.lgreen)
@@ -1581,7 +1689,10 @@ if __name__ == "__main__":
 	# Set up the signals we will solve for
 	#signal_map = SignalMap(shape, wcs, comm, dtype=dtype_map)
 	signal_map = SignalMapGpu(shape, wcs, comm, dtype=np.float32)
-	signal_cut = SignalCutGpu(comm)
+	# FIXME: poly cuts need a better preconditioner or better basis.
+	# The problem is probably that the legendre polynomials lose their orthogonality
+	# with the truncated block approach used here
+	signal_cut = SignalCutGpu(comm, type="full")
 	# Set up the mapmaker
 	mapmaker = MLMapmaker(signals=[signal_cut,signal_map], dtype=dtype_tod, verbose=True, noise_model=NmatDetvecsGpu2())
 	# Add our observations
