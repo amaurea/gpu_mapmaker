@@ -299,323 +299,6 @@ class Nmat:
 	@staticmethod
 	def from_bunch(data): return Nmat()
 
-class NmatUncorr(Nmat):
-	def __init__(self, spacing="exp", nbin=100, nmin=10, window=2, bins=None, ips_binned=None, ivar=None, nwin=None):
-		self.spacing    = spacing
-		self.nbin       = nbin
-		self.nmin       = nmin
-		self.bins       = bins
-		self.ips_binned = ips_binned
-		self.ivar       = ivar
-		self.window     = window
-		self.nwin       = nwin
-		self.ready      = bins is not None and ips_binned is not None and ivar is not None
-	def build(self, tod, srate, **kwargs):
-		# Apply window while taking fft
-		nwin  = utils.nint(self.window*srate)
-		apply_window(tod, nwin)
-		ft    = fft.rfft(tod)
-		# Unapply window again
-		apply_window(tod, nwin, -1)
-		ps = np.abs(ft)**2
-		del ft
-		if   self.spacing == "exp": bins = utils.expbin(ps.shape[-1], nbin=self.nbin, nmin=self.nmin)
-		elif self.spacing == "lin": bins = utils.expbin(ps.shape[-1], nbin=self.nbin, nmin=self.nmin)
-		else: raise ValueError("Unrecognized spacing '%s'" % str(self.spacing))
-		ps_binned  = utils.bin_data(bins, ps) / tod.shape[1]
-		ips_binned = 1/ps_binned
-		# Compute the representative inverse variance per sample
-		ivar = np.zeros(len(tod))
-		for bi, b in enumerate(bins):
-			ivar += ips_binned[:,bi]*(b[1]-b[0])
-		ivar /= bins[-1,1]-bins[0,0]
-		return NmatUncorr(spacing=self.spacing, nbin=len(bins), nmin=self.nmin, bins=bins, ips_binned=ips_binned, ivar=ivar, window=self.window, nwin=nwin)
-	def apply(self, tod, inplace=False):
-		if inplace: tod = np.array(tod)
-		apply_window(tod, self.nwin)
-		ftod = fft.rfft(tod)
-		# Candidate for speedup in C
-		norm = tod.shape[1]
-		for bi, b in enumerate(self.bins):
-			ftod[:,b[0]:b[1]] *= self.ips_binned[:,None,bi]/norm
-		# I divided by the normalization above instead of passing normalize=True
-		# here to reduce the number of operations needed
-		fft.irfft(ftod, tod)
-		apply_window(tod, self.nwin)
-		return tod
-	def white(self, tod, inplace=True):
-		if not inplace: tod = np.array(tod)
-		apply_window(tod, self.nwin)
-		tod *= self.ivar[:,None]
-		apply_window(tod, self.nwin)
-		return tod
-	def write(self, fname):
-		data = bunch.Bunch(type="NmatUncorr")
-		for field in ["spacing", "nbin", "nmin", "bins", "ips_binned", "ivar", "window", "nwin"]:
-			data[field] = getattr(self, field)
-		bunch.write(fname, data)
-	@staticmethod
-	def from_bunch(data):
-		return NmatUncorr(spacing=data.spacing, nbin=data.nbin, nmin=data.nmin, bins=data.bins, ips_binned=data.ips_binned, ivar=data.ivar, window=window, nwin=nwin)
-
-class NmatDetvecs(Nmat):
-	def __init__(self, bin_edges=None, eig_lim=16, single_lim=0.55, mode_bins=[0.25,4.0,20],
-			downweight=[], window=2, nwin=None, verbose=False, bins=None, D=None, V=None, iD=None, iV=None, s=None, ivar=None):
-		# This is all taken from act, not tuned to so yet
-		if bin_edges is None: bin_edges = np.array([
-			0.16, 0.25, 0.35, 0.45, 0.55, 0.70, 0.85, 1.00,
-			1.20, 1.40, 1.70, 2.00, 2.40, 2.80, 3.40, 3.80,
-			4.60, 5.00, 5.50, 6.00, 6.50, 7.00, 8.00, 9.00, 10.0, 11.0,
-			12.0, 13.0, 14.0, 16.0, 18.0, 20.0, 22.0,
-			24.0, 26.0, 28.0, 30.0, 32.0, 36.5, 41.0,
-			45.0, 50.0, 55.0, 65.0, 70.0, 80.0, 90.0,
-			100., 110., 120., 130., 140., 150., 160., 170.,
-			180., 190.
-		])
-		self.bin_edges = bin_edges
-		self.mode_bins = mode_bins
-		self.eig_lim   = np.zeros(len(mode_bins))+eig_lim
-		self.single_lim= np.zeros(len(mode_bins))+single_lim
-		self.verbose   = verbose
-		self.downweight= downweight
-		self.bins = bins
-		self.window = window
-		self.nwin   = nwin
-		self.D, self.V, self.iD, self.iV, self.s, self.ivar = D, V, iD, iV, s, ivar
-		self.ready      = all([a is not None for a in [D, V, iD, iV, s, ivar]])
-	def build(self, tod, srate, extra=False, **kwargs):
-		# Apply window before measuring noise model
-		nwin  = utils.nint(self.window*srate)
-		apply_window(tod, nwin)
-		ft    = fft.rfft(tod)
-		# Unapply window again
-		apply_window(tod, nwin, -1)
-		ndet, nfreq = ft.shape
-		nsamp = tod.shape[1]
-		# First build our set of eigenvectors in two bins. The first goes from
-		# 0.25 to 4 Hz the second from 4Hz and up
-		mode_bins = makebins(self.mode_bins, srate, nfreq, 1000, rfun=np.round)[1:]
-		if np.any(np.diff(mode_bins) < 0):
-			raise RuntimeError(f"At least one of the frequency bins has a negative range: \n{mode_bins}")
-		# Then use these to get our set of basis vectors
-		vecs = find_modes_jon(ft, mode_bins, eig_lim=self.eig_lim, single_lim=self.single_lim, verbose=self.verbose)
-		nmode= vecs.shape[1]
-		if vecs.size == 0: raise errors.ModelError("Could not find any noise modes")
-		# Cut bins that extend beyond our max frequency
-		bin_edges = self.bin_edges[self.bin_edges < srate/2 * 0.99]
-		bins      = makebins(bin_edges, srate, nfreq, nmin=2*nmode, rfun=np.round)
-		nbin      = len(bins)
-		# Now measure the power of each basis vector in each bin. The residual
-		# noise will be modeled as uncorrelated
-		E  = np.zeros([nbin,nmode])
-		D  = np.zeros([nbin,ndet])
-		Nd = np.zeros([nbin,ndet])
-		for bi, b in enumerate(bins):
-			# Skip the DC mode, since it's it's unmeasurable and filtered away
-			b = np.maximum(1,b)
-			E[bi], D[bi], Nd[bi] = measure_detvecs(ft[:,b[0]:b[1]], vecs)
-		# Optionally downweight the lowest frequency bins
-		if self.downweight != None and len(self.downweight) > 0:
-			D[:len(self.downweight)] /= np.array(self.downweight)[:,None]
-		# Instead of VEV' we can have just VV' if we bake sqrt(E) into V
-		V = vecs[None]*E[:,None]**0.5
-		# At this point we have a model for the total noise covariance as
-		# N = D + VV'. But since we're doing inverse covariance weighting
-		# we need a similar representation for the inverse iN. The function
-		# woodbury_invert computes iD, iV, s such that iN = iD + s iV iV'
-		# where s usually is -1, but will become +1 if one inverts again
-		iD, iV, s = woodbury_invert(D, V)
-		# Also compute a representative white noise level
-		bsize = bins[:,1]-bins[:,0]
-		ivar  = np.sum(iD*bsize[:,None],0)/np.sum(bsize)
-		# What about units? I haven't applied any fourier unit factors so far,
-		# so we're in plain power units. From the uncorrelated model I found
-		# that factor of tod.shape[1] is needed
-		iD   *= nsamp
-		iV   *= nsamp**0.5
-		ivar *= nsamp
-		# Fix dtype
-		bins = np.ascontiguousarray(bins.astype(np.int32))
-		D    = np.ascontiguousarray(D.astype(tod.dtype))
-		V    = np.ascontiguousarray(V.astype(tod.dtype))
-		iD   = np.ascontiguousarray(iD.astype(tod.dtype))
-		iV   = np.ascontiguousarray(iV.astype(tod.dtype))
-		nmat = NmatDetvecs(bin_edges=self.bin_edges, eig_lim=self.eig_lim, single_lim=self.single_lim,
-				window=self.window, nwin=nwin, downweight=self.downweight, verbose=self.verbose,
-				bins=bins, D=D, V=V, iD=iD, iV=iV, s=s, ivar=ivar)
-		if extra: return nmat, bunch.Bunch(V=vecs, E=E, D=D)
-		else:     return nmat
-	def apply(self, tod, inplace=True, slow=False):
-		if not inplace: tod = np.array(tod)
-		apply_window(tod, self.nwin)
-		ftod = fft.rfft(tod)
-		norm = tod.shape[1]
-		if slow:
-			for bi, b in enumerate(self.bins):
-				# Want to multiply by iD + siViV'
-				ft    = ftod[:,b[0]:b[1]]
-				iD    = self.iD[bi]/norm
-				iV    = self.iV[bi]/norm**0.5
-				ft[:] = iD[:,None]*ft + self.s*iV.dot(iV.T.dot(ft))
-		else:
-			so3g.nmat_detvecs_apply(ftod.view(tod.dtype), self.bins, self.iD, self.iV, float(self.s), float(norm))
-		# I divided by the normalization above instead of passing normalize=True
-		# here to reduce the number of operations needed
-		fft.irfft(ftod, tod)
-		apply_window(tod, self.nwin)
-		return tod
-	def white(self, tod, inplace=True):
-		if not inplace: tod = np.array(tod)
-		apply_window(tod, self.nwin)
-		tod *= self.ivar[:,None]
-		apply_window(tod, self.nwin)
-		return tod
-	def write(self, fname):
-		data = bunch.Bunch(type="NmatDetvecs")
-		for field in ["bin_edges", "eig_lim", "single_lim", "window", "nwin", "downweight",
-				"bins", "D", "V", "iD", "iV", "s", "ivar"]:
-			data[field] = getattr(self, field)
-		bunch.write(fname, data)
-	@staticmethod
-	def from_bunch(data):
-		return NmatDetvecs(bin_edges=data.bin_edges, eig_lim=data.eig_lim, single_lim=data.single_lim,
-				window=data.window, nwin=data.nwin, downweight=data.downweight,
-				bins=data.bins, D=data.D, V=data.V, iD=data.iD, iV=data.iV, s=data.s, ivar=data.ivar)
-
-class NmatDetvecsGpu(Nmat):
-	def __init__(self, bin_edges=None, eig_lim=16, single_lim=0.55, mode_bins=[0.25,4.0,20],
-			downweight=[], window=2, nwin=None, verbose=False, bins=None, D=None, V=None, E=None, ivar=None,
-			nstream=1):
-		# Variables used for building the noise model
-		if bin_edges is None: bin_edges = np.array([
-			0.16, 0.25, 0.35, 0.45, 0.55, 0.70, 0.85, 1.00,
-			1.20, 1.40, 1.70, 2.00, 2.40, 2.80, 3.40, 3.80,
-			4.60, 5.00, 5.50, 6.00, 6.50, 7.00, 8.00, 9.00, 10.0, 11.0,
-			12.0, 13.0, 14.0, 16.0, 18.0, 20.0, 22.0,
-			24.0, 26.0, 28.0, 30.0, 32.0, 36.5, 41.0,
-			45.0, 50.0, 55.0, 65.0, 70.0, 80.0, 90.0,
-			100., 110., 120., 130., 140., 150., 160., 170.,
-			180., 190.
-		])
-		self.bin_edges = np.array(bin_edges)
-		self.mode_bins = np.array(mode_bins)
-		self.eig_lim   = np.zeros(len(mode_bins))+eig_lim
-		self.single_lim= np.zeros(len(mode_bins))+single_lim
-		self.verbose   = verbose
-		self.downweight= downweight
-		# Variables used for applying the noise model
-		self.bins      = bins
-		self.window    = window
-		self.nwin      = nwin
-		self.D, self.V, self.E, self.ivar = D, V, E, ivar
-		self.ready      = all([a is not None for a in [D, V, E, ivar]])
-		if self.ready:
-			self.D, self.V, self.E, self.ivar = [cupy.asarray(a) for a in [D, V, E, ivar]]
-			self.streams = [cupy.cuda.Stream(non_blocking=True) for i in range(nstream)]
-	def build(self, tod, srate, extra=False, **kwargs):
-		# Apply window before measuring noise model
-		dtype = tod.dtype
-		nwin  = utils.nint(self.window*srate)
-		ndet, nsamp = tod.shape
-		nfreq = nsamp//2+1
-		tod   = cupy.asarray(tod)
-		apply_window(tod, nwin)
-		#ft   = cupy.fft.rfft(tod)
-		ft    = gpu_mm.cufft.rfft(tod, plan_cache=plan_cache)
-		# Unapply window again
-		apply_window(tod, nwin, -1)
-		del tod
-		# First build our set of eigenvectors in two bins. The first goes from
-		# 0.25 to 4 Hz the second from 4Hz and up
-		mode_bins = makebins(self.mode_bins, srate, nfreq, 1000, rfun=np.round)[1:]
-		if np.any(np.diff(mode_bins) < 0):
-			raise RuntimeError(f"At least one of the frequency bins has a negative range: \n{mode_bins}")
-		# Then use these to get our set of basis vectors
-		V = find_modes_jon(ft, mode_bins, eig_lim=self.eig_lim, single_lim=self.single_lim, verbose=self.verbose, dtype=dtype)
-		nmode= V.shape[1]
-		if V.size == 0: raise errors.ModelError("Could not find any noise modes")
-		# Cut bins that extend beyond our max frequency
-		bin_edges = self.bin_edges[self.bin_edges < srate/2 * 0.99]
-		bins      = makebins(bin_edges, srate, nfreq, nmin=2*nmode, rfun=np.round)
-		nbin      = len(bins)
-		# Now measure the power of each basis vector in each bin. The residual
-		# noise will be modeled as uncorrelated
-		E  = cupy.zeros([nbin,nmode],dtype)
-		D  = cupy.zeros([nbin,ndet],dtype)
-		Nd = cupy.zeros([nbin,ndet],dtype)
-		for bi, b in enumerate(bins):
-			# Skip the DC mode, since it's it's unmeasurable and filtered away
-			b = np.maximum(1,b)
-			E[bi], D[bi], Nd[bi] = measure_detvecs(ft[:,b[0]:b[1]], V)
-		del Nd, ft
-		# Optionally downweight the lowest frequency bins
-		if self.downweight != None and len(self.downweight) > 0:
-			D[:len(self.downweight)] /= cupy.array(self.downweight)[:,None]
-		# Also compute a representative white noise level
-		bsize = cupy.array(bins[:,1]-bins[:,0])
-		ivar  = cupy.sum(1/D*bsize[:,None],0)/cupy.sum(bsize)
-		ivar *= nsamp
-		nmat  = NmatDetvecsGpu(bin_edges=self.bin_edges, eig_lim=self.eig_lim, single_lim=self.single_lim,
-				window=self.window, nwin=nwin, downweight=self.downweight, verbose=self.verbose,
-				bins=bins, D=D, V=V, E=E, ivar=ivar)
-		return nmat
-	def apply(self, gtod, inplace=True):
-		t1 = cutime()
-		if not inplace: god = gtod.copy()
-		apply_window(gtod, self.nwin)
-		t2 = cutime()
-		#with scratch.ft.as_allocator():
-		#	ft = cupy.fft.rfft(gtod, axis=1)
-		ft = scratch.ft.view((gtod.shape[0],gtod.shape[1]//2+1),utils.complex_dtype(gtod.dtype))
-		gpu_mm.cufft.rfft(gtod, ft, plan_cache=plan_cache)
-		# If we don't cast to real here, we get the same result but much slower
-		rft = ft.view(gtod.dtype)
-		t3 = cutime()
-		for i, (b1,b2) in enumerate(self.bins*2):
-			# N  = D + VEV'
-			# N" = D" - D"V(E"+V'DV)"V'D"
-			with self.streams[i%len(self.streams)] as s:
-				#iA   = 1/self.D[i,:]
-				#core = cupy.linalg.inv(cupy.diag(1/self.E[i]) + self.V.T @ (iA[:,None]*self.V))
-				#iAd  = iA[:,None]*rft[:,b1:b2]
-				#rft[:,b1:b2] = iAd - iA[:,None] * ((self.V @ core) @ (self.V.T @ iAd))
-				with scratch.nmat_work.as_allocator():
-					iA   = 1/self.D[i,:]
-					core = cupy.linalg.inv(cupy.diag(1/self.E[i]) + self.V.T @ (iA[:,None]*self.V))
-					iAd  = iA[:,None]*rft[:,b1:b2]
-					#rft[:,b1:b2] = iAd - iA[:,None] * ((self.V @ core) @ (self.V.T @ iAd))
-					rft[:,b1:b2] = iAd
-					tmp  = self.V.T @ iAd
-					core.dot(tmp, out=tmp)
-					self.V.dot(tmp, out=iAd)
-					iAd *= iA[:,None]
-					rft[:,b1:b2] -= iAd
-		cupy.cuda.runtime.deviceSynchronize()
-		t4 = cutime()
-		gpu_mm.cufft.irfft(ft, gtod, plan_cache=plan_cache)
-		t5 = cutime()
-		apply_window(gtod, self.nwin)
-		t6 = cutime()
-		L.print("iN sub win %6.4f fft %6.4f mats %6.4f ifft %6.4f win %6.4f ndet %3d nsamp %5d nmode %2d nbin %2d" % (t2-t1,t3-t2,t4-t3,t5-t4,t6-t5, gtod.shape[0], gtod.shape[1], self.V.shape[1], len(self.bins)), level=3)
-		return gtod
-	def white(self, gtod, inplace=True):
-		if not inplace: gtod.copy()
-		apply_window(gtod, self.nwin)
-		gtod *= self.ivar[:,None]
-		apply_window(gtod, self.nwin)
-		return gtod
-	def write(self, fname):
-		data = bunch.Bunch(type="NmatDetvecsGpu")
-		for field in ["bin_edges", "eig_lim", "single_lim", "window", "nwin", "downweight",
-				"bins", "D", "V", "E", "ivar"]:
-			data[field] = getattr(self, field)
-		bunch.write(fname, data)
-	@staticmethod
-	def from_bunch(data):
-		return NmatDetvecsGpu(bin_edges=data.bin_edges, eig_lim=data.eig_lim, single_lim=data.single_lim,
-				window=data.window, nwin=data.nwin, downweight=data.downweight,
-				bins=data.bins, D=data.D, V=data.V, E=data.E, ivar=data.ivar)
-
 def apply_vecs_gpu(ftod, iD, V, Kh, bins, tmp, vtmp, divtmp, handle=None, out=None):
 	"""Jon's core for the noise matrix. Does not allocate any memory itself. Takes the work
 	memory as arguments instead.
@@ -649,7 +332,7 @@ def apply_vecs_gpu(ftod, iD, V, Kh, bins, tmp, vtmp, divtmp, handle=None, out=No
 		# 5. out    = iD ftod - (iD V Kh)(iD V Kh)' ftod [ndet,bsize] -> out = ftod iD - ftod vtmp.T vtmp [bsize,ndet]. OK
 		cublas.sgemm(handle, cublas.CUBLAS_OP_N, cublas.CUBLAS_OP_N, bsize, ndet, nmode, minus_one.ctypes.data, tmp.data.ptr, tmp.shape[1], vtmp.data.ptr, nmode, one.ctypes.data, out.data.ptr+i1*out.itemsize, nfreq)
 
-class NmatDetvecsGpu2(Nmat):
+class NmatDetvecsGpu(Nmat):
 	def __init__(self, bin_edges=None, eig_lim=16, single_lim=0.55, mode_bins=[0.25,4.0,20],
 			downweight=[], window=2, nwin=None, verbose=False, bins=None, iD=None, V=None, Kh=None, ivar=None):
 		# Variables used for building the noise model
@@ -732,7 +415,7 @@ class NmatDetvecsGpu2(Nmat):
 			iK = cupy.diag(iE[bi]) + V.T.dot(iD[bi,:,None] * V)
 			Kh[bi] = np.linalg.cholesky(cupy.linalg.inv(iK))
 		# Construct a fully initialized noise matrix
-		nmat = NmatDetvecsGpu2(bin_edges=self.bin_edges, eig_lim=self.eig_lim, single_lim=self.single_lim,
+		nmat = NmatDetvecsGpu(bin_edges=self.bin_edges, eig_lim=self.eig_lim, single_lim=self.single_lim,
 				window=self.window, nwin=nwin, downweight=self.downweight, verbose=self.verbose,
 				bins=bins, iD=iD, V=V, Kh=Kh, ivar=ivar)
 		return nmat
@@ -772,14 +455,14 @@ class NmatDetvecsGpu2(Nmat):
 		apply_window(gtod, self.nwin)
 		return gtod
 	def write(self, fname):
-		data = bunch.Bunch(type="NmatDetvecsGpu2")
+		data = bunch.Bunch(type="NmatDetvecsGpu")
 		for field in ["bin_edges", "eig_lim", "single_lim", "window", "nwin", "downweight",
 				"bins", "D", "V", "E", "ivar"]:
 			data[field] = getattr(self, field)
 		bunch.write(fname, data)
 	@staticmethod
 	def from_bunch(data):
-		return NmatDetvecsGpu2(bin_edges=data.bin_edges, eig_lim=data.eig_lim, single_lim=data.single_lim,
+		return NmatDetvecsGpu(bin_edges=data.bin_edges, eig_lim=data.eig_lim, single_lim=data.single_lim,
 				window=data.window, nwin=data.nwin, downweight=data.downweight,
 				bins=data.bins, D=data.D, V=data.V, E=data.E, ivar=data.ivar)
 
@@ -1009,123 +692,6 @@ class Signal:
 	def from_work(self, x): return x
 	def write   (self, prefix, tag, x): pass
 
-class SignalMap(Signal):
-	"""Signal describing a non-distributed sky map."""
-	def __init__(self, shape, wcs, comm, name="sky", ofmt="{name}", output=True,
-			ext="fits", dtype=np.float32, sys=None, interpol=None):
-		"""Signal describing a sky map in the coordinate system given by "sys", which defaults
-		to equatorial coordinates. If tiled==True, then this will be a distributed map with
-		the given tile_shape, otherwise it will be a plain enmap. interpol controls the
-		pointing matrix interpolation mode. See so3g's Projectionist docstring for details."""
-		Signal.__init__(self, name, ofmt, output, ext)
-		self.comm  = comm
-		self.sys   = sys
-		self.dtype = dtype
-		self.interpol = interpol
-		self.data  = {}
-		self.comps = "TQU"
-		self.ncomp = 3
-		shape      = tuple(shape[-2:])
-		self.rhs = enmap.zeros((self.ncomp,)+shape, wcs, dtype=dtype)
-		self.div = enmap.zeros(              shape, wcs, dtype=dtype)
-		self.hits= enmap.zeros(              shape, wcs, dtype=dtype)
-	def add_obs(self, id, obs, nmat, Nd, pmap=None):
-		"""Add and process an observation, building the pointing matrix
-		and our part of the RHS. "obs" should be an Observation axis manager,
-		nmat a noise model, representing the inverse noise covariance matrix,
-		and Nd the result of applying the noise model to the detector time-ordered data.
-		"""
-		Nd	 = Nd.copy() # This copy can be avoided if build_obs is split into two parts
-		ctime  = obs.ctime
-		t1     = time.time()
-		print("H", so3g.useful_info()["omp_num_threads"])
-		pcut   = PmatCut(obs.cuts) # could pass this in, but fast to construct
-		if pmap is None:
-			# Build the local geometry and pointing matrix for this observation
-			focal_plane = bunch.Bunch(eta=obs.point_offset[:,0], xi=obs.point_offset[:,1], gamma=np.pi/2-obs.polangle)
-			# Hack: make fp.get("gamma") work
-			focal_plane.get = lambda name: focal_plane.gamma
-			print("I", so3g.useful_info()["omp_num_threads"])
-			pmap = coords.pmat.P.for_tod(
-				obs,
-				timestamps  = obs.ctime,
-				boresight   = bunch.Bunch(el =obs.boresight[0], az=obs.boresight[1], roll=None),
-				focal_plane = focal_plane,
-				comps=self.comps, geom=self.rhs.geometry,
-				threads="domdir", weather="typical", site="so", interpol=self.interpol)
-		print("J", so3g.useful_info()["omp_num_threads"])
-		# Build the RHS for this observation
-		t2 = time.time()
-		pcut.clear(Nd)
-		obs_rhs = pmap.zeros()
-		pmap.to_map(dest=obs_rhs, signal=Nd)
-		t3 = time.time()
-		# Build the per-pixel inverse variance for this observation.
-		# This will be scalar to make the preconditioner fast, but uses
-		# ncomp while building since pmat expects that
-		Nd[:]        = 1
-		pcut.clear(Nd)
-		Nd = nmat.white(Nd)
-		obs_div = pmap.to_map(signal=Nd)[0]
-		t4 = time.time()
-		# Build hitcount
-		Nd[:] = 1
-		pcut.clear(Nd)
-		obs_hits = pmap.to_map(signal=Nd)[0]
-		t5 = time.time()
-		del Nd
-		# Update our full rhs and div. This works for both plain and distributed maps
-		self.rhs = self.rhs .insert(obs_rhs, op=np.ndarray.__iadd__)
-		self.div = self.div .insert(obs_div, op=np.ndarray.__iadd__)
-		self.hits= self.hits.insert(obs_hits,op=np.ndarray.__iadd__)
-		t6 = time.time()
-		L.print("Init map pmat %6.3f rhs %6.3f div %6.3f hit %6.3f add %6.3f %s" % (t2-t1,t3-t2,t4-t3,t5-t4,t6-t5,id), level=2)
-		# Save the per-obs things we need. Just the pointing matrix in our case.
-		# Nmat and other non-Signal-specific things are handled in the mapmaker itself.
-		self.data[id] = bunch.Bunch(pmap=pmap, obs_geo=obs_rhs.geometry)
-	def prepare(self):
-		"""Called when we're done adding everything. Sets up the map distribution,
-		degrees of freedom and preconditioner."""
-		if self.ready: return
-		t1 = time.time()
-		if self.comm is not None:
-			self.rhs  = utils.allreduce(self.rhs, self.comm)
-			self.div  = utils.allreduce(self.div, self.comm)
-			self.hits = utils.allreduce(self.hits,self.comm)
-		self.dof   = MapZipper(*self.rhs.geometry, dtype=self.dtype)
-		self.idiv  = safe_inv(self.div)
-		t2 = time.time()
-		L.print("Prep map %6.3f" % (t2-t1), level=2)
-		self.ready = True
-	def forward(self, id, tod, map, tmul=1, mmul=1):
-		"""map2tod operation. For tiled maps, the map should be in work distribution,
-		as returned by unzip. Adds into tod."""
-		if id not in self.data: return # Should this really skip silently like this?
-		if tmul != 1: tod *= tmul
-		if mmul != 1: map = map*mmul
-		self.data[id].pmap.from_map(dest=tod, signal_map=map, comps=self.comps)
-	def backward(self, id, tod, map, tmul=1, mmul=1):
-		"""tod2map operation. For tiled maps, the map should be in work distribution,
-		as returned by unzip. Adds into map"""
-		if id not in self.data: return
-		if tmul != 1: tod  = tod*tmul
-		if mmul != 1: map *= mmul
-		self.data[id].pmap.to_map(signal=tod, dest=map, comps=self.comps)
-	def precon(self, map):
-		return self.idiv * map
-	def to_work(self, map):
-		return map.copy()
-	def from_work(self, map):
-		if self.comm is None: return map
-		else: return utils.allreduce(map, self.comm)
-	def write(self, prefix, tag, m):
-		if not self.output: return
-		oname = self.ofmt.format(name=self.name)
-		oname = "%s%s_%s.%s" % (prefix, oname, tag, self.ext)
-		if self.comm is None or self.comm.rank == 0:
-			enmap.write_map(oname, m)
-		return oname
-
 class SignalMapGpu(Signal):
 	"""Signal describing a non-distributed sky map."""
 	def __init__(self, shape, wcs, comm, name="sky", ofmt="{name}", output=True,
@@ -1247,67 +813,6 @@ class SignalMapGpu(Signal):
 		oname = "%s%s_%s.%s" % (prefix, oname, tag, self.ext)
 		if self.comm is None or self.comm.rank == 0:
 			enmap.write_map(oname, m[...,:self.ishape[-2],:self.ishape[-1]])
-		return oname
-
-class SignalCut(Signal):
-	def __init__(self, comm, name="cut", ofmt="{name}_{rank:02}", dtype=np.float32,
-			output=False, cut_type=None):
-		"""Signal for handling the ML solution for the values of the cut samples."""
-		Signal.__init__(self, name, ofmt, output, ext="hdf")
-		self.comm  = comm
-		self.data  = {}
-		self.dtype = dtype
-		self.cut_type = cut_type
-		self.off   = 0
-		self.rhs   = []
-		self.div   = []
-	def add_obs(self, id, obs, nmat, Nd):
-		"""Add and process an observation. "obs" should be an Observation axis manager,
-		nmat a noise model, representing the inverse noise covariance matrix,
-		and Nd the result of applying the noise model to the detector time-ordered data."""
-		Nd      = Nd.copy() # This copy can be avoided if build_obs is split into two parts
-		pcut    = PmatCut(obs.cuts, model=self.cut_type)
-		# Build our RHS
-		obs_rhs = np.zeros(pcut.njunk, self.dtype)
-		pcut.backward(Nd, obs_rhs)
-		# Build our per-pixel inverse covmat
-		obs_div = np.ones(pcut.njunk, self.dtype)
-		Nd[:]   = 0
-		pcut.forward(Nd, obs_div)
-		nmat.white(Nd)
-		pcut.backward(Nd, obs_div)
-		self.data[id] = bunch.Bunch(pcut=pcut, i1=self.off, i2=self.off+pcut.njunk)
-		self.off += pcut.njunk
-		self.rhs.append(obs_rhs)
-		self.div.append(obs_div)
-	def prepare(self):
-		"""Process the added observations, determining our degrees of freedom etc.
-		Should be done before calling forward and backward."""
-		if self.ready: return
-		self.rhs = np.concatenate(self.rhs)
-		self.div = np.concatenate(self.div)
-		self.dof = ArrayZipper(self.rhs.shape, dtype=self.dtype, comm=self.comm)
-		self.ready = True
-	def forward(self, id, tod, junk):
-		if id not in self.data: return
-		d = self.data[id]
-		d.pcut.forward(tod, junk[d.i1:d.i2])
-	def precon(self, junk):
-		return junk/self.div
-	def backward(self, id, tod, junk):
-		if id not in self.data: return
-		d = self.data[id]
-		d.pcut.backward(tod, junk[d.i1:d.i2])
-	def write(self, prefix, tag, m):
-		if not self.output: return
-		if self.comm is None:
-			rank = 0
-		else:
-			rank = self.comm.rank
-		oname = self.ofmt.format(name=self.name, rank=rank)
-		oname = "%s%s_%s.%s" % (prefix, oname, tag, self.ext)
-		with h5py.File(oname, "w") as hfile:
-			hfile["data"] = m
 		return oname
 
 class SignalCutGpu(Signal):
@@ -1592,8 +1097,6 @@ class PointingFit:
 		return pointing
 	def wrap(self, pixs):
 		# FIXME: Remove this when mapmaker handles this itself
-		#cupy.clip(pixs[0], 1, self.shape[-2]-2, out=pixs[0])
-		#cupy.clip(pixs[1], 1, self.shape[-1]-2, out=pixs[1])
 		gpu_mm.clip(pixs[0], 1, self.shape[-2]-2)
 		gpu_mm.clip(pixs[1], 1, self.shape[-1]-2)
 		return pixs
@@ -1694,7 +1197,7 @@ if __name__ == "__main__":
 	# with the truncated block approach used here
 	signal_cut = SignalCutGpu(comm, type="full")
 	# Set up the mapmaker
-	mapmaker = MLMapmaker(signals=[signal_cut,signal_map], dtype=dtype_tod, verbose=True, noise_model=NmatDetvecsGpu2())
+	mapmaker = MLMapmaker(signals=[signal_cut,signal_map], dtype=dtype_tod, verbose=True, noise_model=NmatDetvecsGpu())
 	# Add our observations
 	for ind in range(comm.rank, nfile, comm.size):
 		ifile = ifiles[ind]
