@@ -75,9 +75,6 @@ def read_tod(fname, mul=32):
 def round_up  (n, b): return (n+b-1)//b*b
 def round_down(n, b): return n//b*b
 
-#def mask2cuts(mask):
-#	return so3g.proj.ranges.RangesMatrix.from_mask(mask)
-
 # Cuts will be represented by det[nrange], start[nrange], len[nrange]. This is similar to
 # the format used in ACT, but in our test files we have boolean masks instead, which we need
 # convert. This is a bit slow, but is only needed for the test data
@@ -189,14 +186,41 @@ class PmatCutFullGpu:
 	def clear(self, tod):
 		gpu_mm.clear_ranges(tod, self.dets, self.starts, self.lens)
 
+# PmatCutPolyGpu does not have orthogonal basis functions due to
+# the truncated ranges, so it needs a better preconditioner. Since there
+# are only bsize = 400 possible truncation lengths, we can precompute the
+# optimal [order=3,order=3] preconditioner for each length, which would
+# not take much space at all. How would we apply them effectively though?
+# If we could efficiently orthogonalize like this, then we could just
+# bake it into the pointing matrix itself, couldn't we? For the map, the
+# precon covers much less data than the pointing matrix, but for the cuts
+# that's not the case, so I don't think it makes sense to save time
+# in the pointing matrix if it makes the preconditioenr harder to deal with.
+#
+# In any case, we would need to be able to multiply by a 4x4 matric for
+# each block.
+#
+# 1. Indexed matrix multiply: y[ia] = A[q[i]ab]*x[ib]
+#    Takes much less space, but requires the support for indirection.
+# 2. Explicit matrix multiply: y[ia] = A[iab]*x[ib].
+#    This can be done using a simple A.dot(x)
+#
+# #1 doesn't work. It's not supported directly, and looping over
+# slices is very slow.
+# #2 works, but can't be done with .dot, must be done with einsum.
+# Seems to take at least 0.15 ms.
+#
+# TODO: Build P'P once, then invert the 400 different truncations
+# of it. The ivar scaling will be handled with a separate product.
+
 class PmatCutPolyGpu:
 	def __init__(self, cuts, basis=None, order=None, bsize=None):
 		dets, starts, lens = cuts
 		# Either construct or use an existing basis
 		if basis is None:
 			if bsize is None: bsize = 400
-			if order is None: order = 4
-			self.basis = legbasis_gpu(order, bsize)
+			if order is None: order = 3
+			self.basis = legbasis(order, bsize)
 		else:
 			assert order is None and bsize is None, "Specify either basis or order,bsize, not both"
 			order = basis.shape[0]-1
@@ -651,15 +675,33 @@ def split_ranges(dets, starts, lens, maxlen):
 	oends   = offs2-offs
 	return odets, ostarts, oends
 
-def legbasis_gpu(order, n):
-	x   = cupy.linspace(-1, 1, n, dtype=np.float32)
-	out = cupy.empty((order+1, n),dtype=np.float32)
+def legbasis(order, n, ap=np):
+	x   = ap.linspace(-1, 1, n, dtype=np.float32)
+	out = ap.zeros((order+1, n),dtype=np.float32)
 	out[0] = 1
 	if order>0:
 		out[1] = x
 	for i in range(1,order):
 		out[i+1,:] = ((2*i+1)*x*out[i]-i*out[i-1])/(i+1)
 	return out
+
+def leginverses(basis):
+	"""Given a lebasis B[nmode,nsamp], compute all the nsamp truncated
+	inverses of BB'. The result will have shape [nsamp,nmode,nmode]"""
+	# This function is 20x faster on the cpu
+	ap   = anypy(basis)
+	nmode, nsamp = basis.shape
+	mask = ap.tril(ap.ones((nsamp,nsamp), basis.dtype))
+	BBs  = ap.einsum("ai,bi,ji->jab", basis, basis, mask)
+	iBBs = ap.zeros_like(BBs)
+	# These ones should be safe to invert
+	iBBs[nmode-1:] = ap.linalg.inv(BBs[nmode-1:])
+	# Handle the unsafe ones manually
+	for i in range(0, nmode-1):
+		iBBs[i,:i+1,:i+1] = ap.linalg.inv(BBs[i,:i+1,:i+1])
+		for j in range(i+1, nmode):
+			iBBs[i,j,j] = 1
+	return iBBs
 
 # Signal classes represent the degrees of freedom we will solve for.
 # The Zippers should probably be merged with these
@@ -815,49 +857,46 @@ class SignalMapGpu(Signal):
 			enmap.write_map(oname, m[...,:self.ishape[-2],:self.ishape[-1]])
 		return oname
 
-class SignalCutGpu(Signal):
+class SignalCutFullGpu(Signal):
 	# Placeholder for when we have a gpu implementation
 	def __init__(self, comm, name="cut", ofmt="{name}_{rank:02}", dtype=np.float32,
-			output=False, type="poly", **pcut_kwargs):
+			output=False):
 		"""Signal for handling the ML solution for the values of the cut samples."""
 		Signal.__init__(self, name, ofmt, output, ext="hdf")
 		self.comm  = comm
 		self.data  = {}
 		self.dtype = dtype
-		self.type = type
-		self.pcut_kwargs = pcut_kwargs
 		self.off   = 0
 		self.rhs   = []
-		self.div   = []
+		self.idiv  = []
 	def add_obs(self, id, obs, nmat, Nd):
 		"""Add and process an observation. "obs" should be an Observation axis manager,
 		nmat a noise model, representing the inverse noise covariance matrix,
 		and Nd the result of applying the noise model to the detector time-ordered data."""
 		Nd      = Nd.copy() # This copy can be avoided if build_obs is split into two parts
-		pclass  = {"null":PmatCutNull, "full":PmatCutFullGpu, "poly":PmatCutPolyGpu}[self.type]
-		pcut    = pclass(obs.cuts, **self.pcut_kwargs)
+		pcut    = PmatCutFullGpu(obs.cuts)
 		# Build our RHS
 		obs_rhs = cupy.zeros(pcut.ndof, self.dtype)
 		pcut.backward(Nd, obs_rhs)
-		# Build our per-pixel inverse covmat
+		obs_rhs = obs_rhs.get()
+		# Build our preconditioner.
 		obs_div = cupy.ones(pcut.ndof, self.dtype)
 		Nd[:]   = 0
 		pcut.forward(Nd, obs_div)
 		nmat.white(Nd)
 		pcut.backward(Nd, obs_div)
-		# Needed for poly cut it seems
-		#obs_div[:] = cupy.mean(np.abs(obs_div))
+		obs_idiv = 1/obs_div.get() # back to the cpu
 		self.data[id] = bunch.Bunch(pcut=pcut, i1=self.off, i2=self.off+pcut.ndof)
 		self.off += pcut.ndof
-		self.rhs.append(obs_rhs.get())
-		self.div.append(obs_div.get())
+		self.rhs.append(obs_rhs)
+		self.idiv.append(obs_idiv)
 		gpu_garbage_collect()
 	def prepare(self):
 		"""Process the added observations, determining our degrees of freedom etc.
 		Should be done before calling forward and backward."""
 		if self.ready: return
 		self.rhs = np.concatenate(self.rhs)
-		self.div = np.concatenate(self.div)
+		self.idiv= np.concatenate(self.idiv)
 		self.dof = ArrayZipper(self.rhs.shape, dtype=self.dtype, comm=self.comm)
 		self.ready = True
 	def forward(self, id, gtod, gjunk):
@@ -865,7 +904,9 @@ class SignalCutGpu(Signal):
 		d = self.data[id]
 		d.pcut.forward(gtod, gjunk[d.i1:d.i2])
 	def precon(self, junk):
-		return junk/self.div
+		print("A", np.std(junk))
+		print("B", np.std(junk*self.idiv))
+		return junk*self.idiv
 	def backward(self, id, gtod, gjunk):
 		if id not in self.data: return
 		d = self.data[id]
@@ -883,6 +924,60 @@ class SignalCutGpu(Signal):
 		with h5py.File(oname, "w") as hfile:
 			hfile["data"] = m
 		return oname
+
+class SignalCutPolyGpu(SignalCutFullGpu):
+	def __init__(self, comm, order=3, bsize=400, precon="none", name="cut",
+			ofmt="{name}_{rank:02}", dtype=np.float32, output=False):
+		"""Signal for handling the ML solution for the values of the cut samples."""
+		SignalCutFullGpu.__init__(self, comm, name=name, ofmt=ofmt, dtype=dtype, output=output)
+		self.order  = order
+		self.bsize  = bsize
+		self.basis  = legbasis(order, bsize)
+		self.prec   = precon
+		if precon == "leginv":
+			self.ibases = leginverses(self.basis)
+	def add_obs(self, id, obs, nmat, Nd):
+		"""Add and process an observation. "obs" should be an Observation axis manager,
+		nmat a noise model, representing the inverse noise covariance matrix,
+		and Nd the result of applying the noise model to the detector time-ordered data."""
+		Nd      = Nd.copy() # This copy can be avoided if build_obs is split into two parts
+		pcut    = PmatCutPolyGpu(obs.cuts, basis=self.basis)
+		# Build our RHS
+		obs_rhs = cupy.zeros(pcut.ndof, self.dtype)
+		pcut.backward(Nd, obs_rhs)
+		obs_rhs = obs_rhs.get()
+		# Build our preconditioner. We have precomputed the basis.dot(basis.T) inverse for
+		# all block lengths, so we just read out the appropriate one for each block.
+		# TODO: Understand why the none-preconditioner suddenly works fine, while
+		# the other two breaks convergence. Apparently this only happens when I include
+		# 1/ivar in them, otherwise they don't hurt but also don't beat none. Very
+		# strange.
+		if self.prec == "leginv":
+			obs_idiv = self.ibases[pcut.lens.get()-1] / nmat.ivar[pcut.dets].get()[:,None,None]
+		elif self.prec == "var":
+			obs_idiv = 1/nmat.ivar[pcut.dets].get()
+		elif self.prec == "none":
+			obs_idiv = [1]
+		else: raise ValueError("Unknown precon '%s'" % str(self.prec))
+		self.data[id] = bunch.Bunch(pcut=pcut, i1=self.off, i2=self.off+pcut.ndof)
+		self.off += pcut.ndof
+		self.rhs.append(obs_rhs)
+		self.idiv.append(obs_idiv)
+		gpu_garbage_collect()
+	def precon(self, junk):
+		# For some reason this fails with negative residuals when I use this well-motivated
+		# and symmetric preconditioner, but suddenly works fine when I use no preconditioner at all.
+		if self.prec == "leginv":
+			bjunk = junk.reshape(-1, self.basis.shape[0])
+			bjunk = np.einsum("iab,ib->ia", self.idiv, bjunk)
+			return bjunk.reshape(-1)
+		elif self.prec == "var":
+			bjunk = junk.reshape(-1, self.basis.shape[0]).copy()
+			bjunk *= self.idiv[:,None]
+			return bjunk.reshape(-1)
+		elif self.prec == "none":
+			return junk.copy()
+		else: raise ValueError("Unknown precon '%s'" % str(self.prec))
 
 class MLMapmaker:
 	def __init__(self, signals=[], noise_model=None, dtype=np.float32, verbose=False, mode="gpu"):
@@ -1195,7 +1290,8 @@ if __name__ == "__main__":
 	# FIXME: poly cuts need a better preconditioner or better basis.
 	# The problem is probably that the legendre polynomials lose their orthogonality
 	# with the truncated block approach used here
-	signal_cut = SignalCutGpu(comm, type="full")
+	signal_cut = SignalCutPolyGpu(comm, precon="var")
+	signal_cut = SignalCutFullGpu(comm)
 	# Set up the mapmaker
 	mapmaker = MLMapmaker(signals=[signal_cut,signal_map], dtype=dtype_tod, verbose=True, noise_model=NmatDetvecsGpu())
 	# Add our observations
